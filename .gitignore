@@ -1,0 +1,16 @@
+*.swp
+*.swo
+pycparser/appveyor.yml
+pycparser/CHANGES
+pycparser/_clean_tables.py
+pycparser/CONTRIBUTORS
+pycparser/examples
+pycparser/LICENSE
+pycparser/MANIFEST.in
+pycparser/README.rst
+pycparser/setup.cfg
+pycparser/setup.py
+pycparser/tests
+pycparser/TODO.txt
+pycparser/tox.ini
+pycparser/utils
