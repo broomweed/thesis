@@ -1,6 +1,14 @@
+typedef struct schmoo {
+    int yes;
+} schmoo;
+
+typedef schmoo* const blorp;
+
+typedef schmoo bloop;
+
 const int x;
 
 int blah(const int y) {
-    const int z = 2;
-    return z;
+    blorp z;
+    return z->yes;
 }
