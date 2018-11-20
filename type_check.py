@@ -1,4 +1,5 @@
 import sys
+import copy
 
 sys.path.extend(['pycparser'])
 
@@ -24,7 +25,7 @@ class NamedType:
         Also the names are a list of strings because
         we have stuff like 'unsigned int'. This basically
         comes straight from pycparser. """
-    def __init__(self, names):
+    def __init__(self, names, quals):
         self.names = names
         for name in names:
             if name not in { "unsigned", "signed", "long", "short",
@@ -33,6 +34,7 @@ class NamedType:
                 break
         else:
             self.is_typedef = False
+        self.quals = quals
 
     def __str__(self):
         return " ".join(self.names)
@@ -42,28 +44,17 @@ class StructType:
     """ A struct type.
         Has a list of fields, which are represented as
         a list of tuples of names and types. """
-    def __init__(self, name, fields, field_order):
+    def __init__(self, name, fields, field_order, quals):
         if len(name) != 0:
             self.name = name
         else:
             self.name = '<anonymous>'
         self.fields = fields
         self.field_order = field_order
-
-    def __str__(self):
-        return 'struct ' + self.name
-
-
-class BaseType:
-    """ A non-pointer type.
-        tp = name for the type
-        quals = list of qualifiers (const etc) """
-    def __init__(self, tp, quals):
-        self.tp = tp
         self.quals = quals
 
     def __str__(self):
-        return str(self.tp) + "".join([" " + x for x in self.quals])
+        return 'struct ' + self.name
 
 
 class PointerType:
@@ -78,36 +69,60 @@ class PointerType:
         return str(self.ptrto) + "*" + "".join([" " + x for x in self.quals])
 
 
-def convert_type(node, info):
-    """ Convert a c_ast type node to a Type object. """
-    t = type(node)
-
-    if t == c_ast.PtrDecl:
-        return PointerType(convert_type(node.type, info), node.quals)
-    elif t == c_ast.ArrayDecl:
-        return PointerType(convert_type(node.type, info), [])
-    elif t == c_ast.TypeDecl:
-        return BaseType(convert_type(node.type, info), node.quals)
-    elif t == c_ast.IdentifierType:
-        return NamedType(node.names)
-    elif t == c_ast.Struct:
-        if node.decls is not None:
-            # Declaring struct type
-            # (If we don't hit this if-branch, we're declaring a variable
-            #  with the struct type instead.)
-            # TODO: I think this will fail if we have like 'struct X;'
-            # alone on its own line.
-            fields = {}
-            field_order = []
-            for decl in node.decls:
-                name = decl.name
-                tp = get_type(decl, {}, info)
-                fields[name] = tp
-                field_order.append(name)
-                info['structs'][node.name] = StructType(node.name, fields, field_order)
-        return info['structs'][node.name]
+def is_ptr(t, info):
+    """ Returns whether or not a type is a pointer. """
+    if type(unwrap_type(t, info)) == PointerType:
+        return True
     else:
-        raise TypeCheckError(node.coord, "Don't know how to convert type " + str(t))
+        return False
+
+
+def is_owned_ptr(t, info):
+    """ Returns whether or not a type is an OWNED pointer.
+        (This is necessary because t might be a typedef
+        that has '@owned' in its own qualifications, but not
+        in the qualifications of the actual pointer type.)
+        (They might be at different nested typedefs, for example.) """
+    if is_ptr(t, info):
+        u = unwrap_type(t, info)
+        return '@owned' in u.quals
+    else:
+        return False
+
+
+def convert_type(node, info):
+    def recurse(node, info, quals):
+        """ Convert a c_ast type node to a Type object. """
+        t = type(node)
+
+        if t == c_ast.PtrDecl:
+            return PointerType(recurse(node.type, info, []), quals + node.quals)
+        elif t == c_ast.ArrayDecl:
+            return PointerType(recurse(node.type, info, []), quals)
+        elif t == c_ast.TypeDecl:
+            return recurse(node.type, info, quals + node.quals)
+        elif t == c_ast.IdentifierType:
+            return NamedType(node.names, quals)
+        elif t == c_ast.Struct:
+            if node.decls is not None:
+                # Declaring struct type
+                # (If we don't hit this if-branch, we're declaring a variable
+                #  with the struct type instead.)
+                # TODO: I think this will fail if we have like 'struct X;'
+                # alone on its own line.
+                fields = {}
+                field_order = []
+                for decl in node.decls:
+                    name = decl.name
+                    tp = get_type(decl, {}, info)
+                    fields[name] = tp
+                    field_order.append(name)
+                    info['structs'][node.name] = StructType(node.name, fields, field_order, quals)
+            return info['structs'][node.name]
+        else:
+            raise TypeCheckError(node.coord, "Don't know how to convert type " + str(t))
+
+    return recurse(node, info, [])
 
 
 def assignment_okay(var, expr, info):
@@ -115,9 +130,9 @@ def assignment_okay(var, expr, info):
         to something of type `var`. """
     var = unwrap_type(var, info)
     expr = unwrap_type(expr, info)
-    if type(var) == BaseType and "const" in var.quals:
+    if "const" in var.quals:
         # can't reassign const variables
-        return False
+        return False, "Can't reassign a const variable."
 
     return initialization_okay(var, expr, info)
 
@@ -127,28 +142,24 @@ def initialization_okay(var, expr, info):
         to things that are const because we're initializing. """
     var = unwrap_type(var, info)
     expr = unwrap_type(expr, info)
-    if type(var) == NamedType and type(expr) == BaseType:
-        # This is so that if we have e.g. 'const int x = 5', where
-        # 5 is of NamedType 'int' and x is of BaseType 'int const',
-        # we can still do the assignment correctly.
-        return initialization_okay(BaseType(var, []), expr, info)
-    elif type(var) == BaseType and type(expr) == NamedType:
-        return initialization_okay(var, BaseType(expr, []), info)
-    elif type(var) != type(expr):
-        return False
+    if is_ptr(var, info) and not is_ptr(expr, info):
+        return False, "Making pointer from non-pointer without a cast."
+    elif not is_ptr(var, info) and is_ptr(expr, info):
+        return False, "Assigning pointer to non-pointer variable without a cast."
 
-    if type(var) == PointerType:
+    if is_ptr(var, info):
+        print(var, " <- ", expr)
+        if is_owned_ptr(var, info) and not is_owned_ptr(expr, info):
+            return False, "Can't assign an unowned pointer value to an owned pointer variable."
         return initialization_okay(var.ptrto, expr.ptrto, info)
-    if type(var) == BaseType:
-        return initialization_okay(var.tp, expr.tp, info)
     if type(var) == NamedType:
-        return var.names == expr.names
+        return var.names == expr.names, "Can't convert %s to %s" % (" ".join(expr.names), " ".join(var.names))
     if type(var) == StructType:
         # TODO this fails if we have two different structs with
         # the same name (e.g. in different scopes.) I don't think
         # this is a big issue to solve here, but worth noting that
         # it's actually wrong.
-        return var.name == expr.name
+        return var.name == expr.name, "Can't convert struct %s to struct %s" % (expr.name, var.name)
 
     raise Exception(
         "Don't know how to handle assignment: " + str(var) + " <- " + str(expr)
@@ -156,21 +167,24 @@ def initialization_okay(var, expr, info):
 
 
 def unwrap_type(t, info):
-    """ Given a type, if it's a typedef, or BaseType, then
+    """ Given a type, if it's a typedef, then
         find its actual underlying type.
         (note: will throw KeyError if a typedef refers to
         a nonexistent type. But that should have been an
         error anyway when we encountered the typedef, so
-        it's fine.) """
-    if type(t) == BaseType:
-        if is_typedef(t):
-            return unwrap_type(t.tp, info)
+        it's fine.)
+        It also keeps track of the qualifiers of the types
+        that it encounters along the way, so if A is a
+        typedef for B, and we have an A const, unwrapping
+        it should yield a B const. """
+    def recurse(t, info, extra_quals):
+        if type(t) == NamedType and t.is_typedef:
+            return recurse(info['typedefs'][t.names[0]], info, extra_quals + t.quals)
         else:
-            return t.tp
-    if type(t) == NamedType and t.is_typedef:
-        return unwrap_type(info['typedefs'][t.names[0]], info)
-    else:
-        return t
+            fresh_type = copy.deepcopy(t)
+            fresh_type.quals += extra_quals
+            return fresh_type
+    return recurse(t, info, [])
 
 
 def expand_type_name(t, info):
@@ -179,19 +193,18 @@ def expand_type_name(t, info):
     def recurse(t, info, use_brackets, suffix):
         # This internal function prevents an explosion of brackets
         # for nested typedefs. And lets us put a suffix on the end.
-        if type(t) == BaseType and is_typedef(t):
-                if len(t.quals) > 0:
-                    return recurse(t.tp, info, use_brackets, " " + " ".join(t.quals) + suffix)
-                else:
-                    return recurse(t.tp, info, use_brackets, suffix)
-        if type(t) == NamedType and t.is_typedef:
-            if use_brackets:
-                return str(t) + suffix + (" [= "
-                    + recurse(info['typedefs'][t.names[0]], info, False, suffix) + "]")
-            else:
-                return str(t) + suffix + (" = "
-                    + recurse(info['typedefs'][t.names[0]], info, False, suffix))
-        if type(t) == PointerType and is_typedef(t.ptrto):
+        if use_brackets:
+            equals = " [= "
+            endbracket = "]"
+        else:
+            equals = " = "
+            endbracket = ""
+
+        if is_typedef(t):
+            return (str(t) + suffix + equals
+                        + recurse(info['typedefs'][t.names[0]], info, False, " ".join(t.quals) + suffix)
+                        + endbracket)
+        elif is_ptr(t, info) and is_typedef(t.ptrto):
             if len(t.quals) > 0 or len(suffix) > 0:
                 return recurse(t.ptrto, info, use_brackets, "* " + " ".join(t.quals) + suffix)
             else:
@@ -204,9 +217,7 @@ def expand_type_name(t, info):
 
 def is_typedef(t):
     """ Return whether or not a given type is a typedef. """
-    if type(t) == BaseType:
-        return is_typedef(t.tp)
-    elif type(t) == NamedType:
+    if type(t) == NamedType:
         return t.is_typedef
     else:
         return False
@@ -234,7 +245,7 @@ def get_type(node, context, info):
                 continue
 
     elif t == c_ast.FuncDef:
-        info_with_return = info.copy()
+        info_with_return = copy.deepcopy(info)
         info_with_return['func_return'] = convert_type(node.decl.type.type, info)
         info_with_return['func_name'] = node.decl.name
 
@@ -267,11 +278,13 @@ def get_type(node, context, info):
         tp = convert_type(node.type, info)
         if node.init != None:
             expr_tp = get_type(node.init, context, info)
-            if not initialization_okay(tp, expr_tp, info):
+            ok, reason = initialization_okay(tp, expr_tp, info)
+            if not ok:
                 raise TypeCheckError(
                     node.coord, "can't initialize variable " + node.name
                                 + " of type " + expand_type_name(tp, info)
                                 + " with expression of type " + expand_type_name(expr_tp, info)
+                                + ": " + reason
                 )
         # Associate the type with the name in context.
         context[node.name] = tp
@@ -297,28 +310,28 @@ def get_type(node, context, info):
     elif t == c_ast.StructRef:
         if node.type == "->":
             # a->b
-            is_ptr = True
+            type_is_ptr = True
             left_type = get_type(node.name, context, info)
             real_left_type = unwrap_type(left_type, info)
             if type(real_left_type) != PointerType:
                 # Using -> on a non-pointer.
                 raise TypeCheckError(
                     node.coord, "can't use -> access on expression of type "
-                                + expand_type_name(real_left_type, info)
+                                + expand_type_name(left_type, info)
                                 + ", which isn't a pointer type"
                 )
 
             struct_type = unwrap_type(real_left_type.ptrto, info)
         else:
             # a.b
-            is_ptr = False
+            type_is_ptr = False
             left_type = get_type(node.name, context, info)
             real_left_type = struct_type = unwrap_type(left_type, info)
 
         type_str = expand_type_name(left_type, info)
 
         if type(struct_type) != StructType:
-            if not is_ptr:
+            if not type_is_ptr:
                 # Using . on a non-struct type.
                 raise TypeCheckError(
                     node.coord, "request for element '" + node.field.name
@@ -349,11 +362,16 @@ def get_type(node, context, info):
         var_type = get_type(node.lvalue, context, info)
         expr_type = get_type(node.rvalue, context, info)
 
-        if not assignment_okay(var_type, expr_type, info):
+        print("Assignment: " + expand_type_name(var_type, info) + " to " + expand_type_name(expr_type, info))
+        print(filecontent[node.coord.line - 1])
+        print(str(is_owned_ptr(var_type, info)), "->", str(is_owned_ptr(expr_type, info)))
+
+        ok, reason = assignment_okay(var_type, expr_type, info)
+        if not ok:
             raise TypeCheckError(
                 node.coord, "can't assign expression of type "
                           + expand_type_name(expr_type, info) + " to variable of type "
-                          + expand_type_name(var_type, info)
+                          + expand_type_name(var_type, info) + ": " + reason
             )
 
     elif t == c_ast.BinaryOp:
