@@ -1,11 +1,17 @@
-import sys
-import copy
+import sys, copy
+from enum import Enum
 
 sys.path.extend(['pycparser'])
 
 from pycparser import parse_file, c_parser, c_ast
 
 filecontent = None
+
+class State(Enum):
+    UNOWNED = 0
+    # uninitialized or free; the 'zombie' name is from the POM paper
+    ZOMBIE = 1
+    OWNED = 2
 
 class TypeCheckError(Exception):
     def __init__(self, location, msg):
@@ -83,11 +89,11 @@ def is_owned_ptr(t, info):
         that has '@owned' in its own qualifications, but not
         in the qualifications of the actual pointer type.)
         (They might be at different nested typedefs, for example.) """
-    if is_ptr(t, info):
-        u = unwrap_type(t, info)
-        return '@owned' in u.quals
-    else:
-        return False
+    return is_ptr(t, info) and '@owned' in unwrap_type(t, info).quals
+
+
+def is_unowned_ptr(t, info):
+    return is_ptr(t, info) and not is_owned_ptr(t, info)
 
 
 def convert_type(node, info):
@@ -108,8 +114,8 @@ def convert_type(node, info):
                 # Declaring struct type
                 # (If we don't hit this if-branch, we're declaring a variable
                 #  with the struct type instead.)
-                # TODO: I think this will fail if we have like 'struct X;'
-                # alone on its own line.
+                # NOTE: I think this will fail if we have like 'struct X;'
+                # alone on its own line. But unsure if this matters that much.
                 fields = {}
                 field_order = []
                 for decl in node.decls:
@@ -125,7 +131,7 @@ def convert_type(node, info):
     return recurse(node, info, [])
 
 
-def assignment_okay(var, expr, info):
+def assignment_okay(var, expr, varname, info):
     """ Check whether something of type `expr` can be assigned
         to something of type `var`. """
     var = unwrap_type(var, info)
@@ -134,28 +140,38 @@ def assignment_okay(var, expr, info):
         # can't reassign const variables
         return False, "Can't reassign a const variable."
 
-    return initialization_okay(var, expr, info)
+    return initialization_okay(var, expr, varname, info)
 
 
-def initialization_okay(var, expr, info):
+def initialization_okay(var, expr, varname, info):
     """ Same as assignment_okay, except that it's okay to assign
         to things that are const because we're initializing. """
     var = unwrap_type(var, info)
     expr = unwrap_type(expr, info)
+
     if is_ptr(var, info) and not is_ptr(expr, info):
         return False, "Making pointer from non-pointer without a cast."
     elif not is_ptr(var, info) and is_ptr(expr, info):
         return False, "Assigning pointer to non-pointer variable without a cast."
 
-    if is_ptr(var, info):
-        print(var, " <- ", expr)
-        if is_owned_ptr(var, info) and not is_owned_ptr(expr, info):
-            return False, "Can't assign an unowned pointer value to an owned pointer variable."
-        return initialization_okay(var.ptrto, expr.ptrto, info)
     if type(var) == NamedType:
         return var.names == expr.names, "Can't convert %s to %s" % (" ".join(expr.names), " ".join(var.names))
+
+    if is_ptr(var, info):
+        if is_owned_ptr(var, info) and is_unowned_ptr(expr, info):
+            return False, "Can't convert an unowned pointer value to an owned pointer variable."
+        elif is_owned_ptr(var, info):
+            if info['states'][varname] == State.ZOMBIE:
+                # TODO: If source being assigned is also an lvalue,
+                # need to set its status to ZOMBIE.
+                info['states'][varname] = State.OWNED
+            else:
+                return False, "Can't overwrite an owned pointer value without freeing or moving it first."
+
+        return initialization_okay(var.ptrto, expr.ptrto, varname, info)
+
     if type(var) == StructType:
-        # TODO this fails if we have two different structs with
+        # NOTE: this fails if we have two different structs with
         # the same name (e.g. in different scopes.) I don't think
         # this is a big issue to solve here, but worth noting that
         # it's actually wrong.
@@ -276,9 +292,18 @@ def get_type(node, context, info):
         # its declared type. Doesn't matter if it's extern, or
         # something -- just assume it's correct.
         tp = convert_type(node.type, info)
+
+        unwrapped_type = unwrap_type(tp, info)
+        if is_ptr(unwrapped_type, info):
+            if is_owned_ptr(unwrapped_type, info):
+                info['states'][node.name] = State.ZOMBIE
+            else:
+                info['states'][node.name] = State.UNOWNED
+
         if node.init != None:
             expr_tp = get_type(node.init, context, info)
-            ok, reason = initialization_okay(tp, expr_tp, info)
+            ok, reason = initialization_okay(tp, expr_tp, node.name, info)
+
             if not ok:
                 raise TypeCheckError(
                     node.coord, "can't initialize variable " + node.name
@@ -286,6 +311,11 @@ def get_type(node, context, info):
                                 + " with expression of type " + expand_type_name(expr_tp, info)
                                 + ": " + reason
                 )
+
+            if is_owned_ptr(unwrapped_type, info):
+                # If it's initialized, mark it OWNED
+                info['states'][node.name] = State.OWNED
+
         # Associate the type with the name in context.
         context[node.name] = tp
         return tp
@@ -366,7 +396,8 @@ def get_type(node, context, info):
         print(filecontent[node.coord.line - 1])
         print(str(is_owned_ptr(var_type, info)), "->", str(is_owned_ptr(expr_type, info)))
 
-        ok, reason = assignment_okay(var_type, expr_type, info)
+        # TODO This will fail when the lvalue is not a bare variable name!
+        ok, reason = assignment_okay(var_type, expr_type, node.lvalue.name, info)
         if not ok:
             raise TypeCheckError(
                 node.coord, "can't assign expression of type "
@@ -383,6 +414,20 @@ def get_type(node, context, info):
         # TODO. Also, need to handle type promotion etc.
         # (this says e.g. int + float -> int, but it should be float)
         return l_type
+
+    elif t == c_ast.UnaryOp:
+        if node.op == "*":
+            node_type = get_type(node.expr, context, info)
+            if is_ptr(node_type, info):
+                return node_type.ptrto
+            else:
+                raise TypeCheckError(
+                    node.coord, "Can't dereference expression of non-pointer type: "
+                              + expand_type_name(node_type, info)
+                )
+        elif node.op == "&":
+            node_type = get_type(node.expr, context, info)
+            return PointerType(node_type, [])
 
     elif t == c_ast.If:
         cond_type = get_type(node.cond, context, info)
@@ -408,19 +453,24 @@ def get_type(node, context, info):
     elif t == c_ast.Constant:
         # Just a constant value.
         if node.type == "string":
-            return PointerType(NamedType(["char"]), ["const"])
+            return PointerType(NamedType(["char"], []), ["const"])
         else:
-            return NamedType([node.type])
+            return NamedType([node.type], [])
+
+    elif t == c_ast.Cast:
+        return convert_type(node.to_type.type, info)
 
     elif t == c_ast.Return:
         returned_type = get_type(node.expr, context, info)
-        if not assignment_okay(info['func_return'], returned_type, info):
+        ok, reason = assignment_okay(info['func_return'], returned_type, '<return value>', info)
+        if not ok:
             raise TypeCheckError(
                 node.coord, "in function " + info['func_name']
                           + ", declared as returning type "
                           + expand_type_name(info['func_return'], info)
                           + ": can't return expression of type "
                           + expand_type_name(returned_type, info)
+                          + ": " + reason
             )
 
     elif t == c_ast.EmptyStatement:
@@ -440,4 +490,4 @@ if __name__ == "__main__":
         print("required: name of file to parse")
         sys.exit(1)
 
-    get_type(ast, {}, {'typedefs': {}, 'structs': {}})
+    get_type(ast, {}, {'typedefs': {}, 'structs': {}, 'states': {}})
