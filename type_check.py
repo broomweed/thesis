@@ -75,24 +75,29 @@ class PointerType:
         return str(self.ptrto) + "*" + "".join([" " + x for x in self.quals])
 
 
-def is_ptr(t, info):
+def is_ptr(t, info=None):
     """ Returns whether or not a type is a pointer. """
+    if info is None:
+        return type(t) == PointerType
+
     if type(unwrap_type(t, info)) == PointerType:
         return True
     else:
         return False
 
 
-def is_owned_ptr(t, info):
+def is_owned_ptr(t, info=None):
     """ Returns whether or not a type is an OWNED pointer.
         (This is necessary because t might be a typedef
         that has '@owned' in its own qualifications, but not
         in the qualifications of the actual pointer type.)
         (They might be at different nested typedefs, for example.) """
+    if info is None:
+        return type(t) == PointerType and '@owned' in t.quals
     return is_ptr(t, info) and '@owned' in unwrap_type(t, info).quals
 
 
-def is_unowned_ptr(t, info):
+def is_unowned_ptr(t, info=None):
     return is_ptr(t, info) and not is_owned_ptr(t, info)
 
 
@@ -131,7 +136,7 @@ def convert_type(node, info):
     return recurse(node, info, [])
 
 
-def assignment_okay(var, expr, varname, info):
+def assignment_okay(var, expr, info):
     """ Check whether something of type `expr` can be assigned
         to something of type `var`. """
     var = unwrap_type(var, info)
@@ -140,10 +145,10 @@ def assignment_okay(var, expr, varname, info):
         # can't reassign const variables
         return False, "Can't reassign a const variable."
 
-    return initialization_okay(var, expr, varname, info)
+    return initialization_okay(var, expr, info)
 
 
-def initialization_okay(var, expr, varname, info):
+def initialization_okay(var, expr, info):
     """ Same as assignment_okay, except that it's okay to assign
         to things that are const because we're initializing. """
     var = unwrap_type(var, info)
@@ -158,17 +163,7 @@ def initialization_okay(var, expr, varname, info):
         return var.names == expr.names, "Can't convert %s to %s" % (" ".join(expr.names), " ".join(var.names))
 
     if is_ptr(var, info):
-        if is_owned_ptr(var, info) and is_unowned_ptr(expr, info):
-            return False, "Can't convert an unowned pointer value to an owned pointer variable."
-        elif is_owned_ptr(var, info):
-            if info['states'][varname] == State.ZOMBIE:
-                # TODO: If source being assigned is also an lvalue,
-                # need to set its status to ZOMBIE.
-                info['states'][varname] = State.OWNED
-            else:
-                return False, "Can't overwrite an owned pointer value without freeing or moving it first."
-
-        return initialization_okay(var.ptrto, expr.ptrto, varname, info)
+        return initialization_okay(var.ptrto, expr.ptrto, info)
 
     if type(var) == StructType:
         # NOTE: this fails if we have two different structs with
@@ -245,6 +240,8 @@ def show_error(e):
     print(" " * (e.column - 1) + "^")
 
 
+node_types = {}
+
 def get_type(node, context, info):
     """ Walks over the pycparser-generated AST.
         Checks that a statement has correct type, and also returns
@@ -302,7 +299,7 @@ def get_type(node, context, info):
 
         if node.init != None:
             expr_tp = get_type(node.init, context, info)
-            ok, reason = initialization_okay(tp, expr_tp, node.name, info)
+            ok, reason = initialization_okay(tp, expr_tp, info)
 
             if not ok:
                 raise TypeCheckError(
@@ -318,7 +315,8 @@ def get_type(node, context, info):
 
         # Associate the type with the name in context.
         context[node.name] = tp
-        return tp
+
+        node_types[node] = tp
 
     elif t == c_ast.Typedef:
         if node.name in info['typedefs']:
@@ -383,7 +381,7 @@ def get_type(node, context, info):
                             + "(has fields: " + ", ".join(struct_type.fields) + ")"
             )
         else:
-            return struct_type.fields[node.field.name]
+            node_types[node] = struct_type.fields[node.field.name]
 
     elif t == c_ast.Assignment:
         if node.op != "=":
@@ -397,7 +395,7 @@ def get_type(node, context, info):
         print(str(is_owned_ptr(var_type, info)), "->", str(is_owned_ptr(expr_type, info)))
 
         # TODO This will fail when the lvalue is not a bare variable name!
-        ok, reason = assignment_okay(var_type, expr_type, node.lvalue.name, info)
+        ok, reason = assignment_okay(var_type, expr_type, info)
         if not ok:
             raise TypeCheckError(
                 node.coord, "can't assign expression of type "
@@ -413,13 +411,13 @@ def get_type(node, context, info):
         # (like, we shouldn't use division on pointers)
         # TODO. Also, need to handle type promotion etc.
         # (this says e.g. int + float -> int, but it should be float)
-        return l_type
+        node_types[node] = l_type
 
     elif t == c_ast.UnaryOp:
         if node.op == "*":
             node_type = get_type(node.expr, context, info)
             if is_ptr(node_type, info):
-                return node_type.ptrto
+                node_types[node] = node_type.ptrto
             else:
                 raise TypeCheckError(
                     node.coord, "Can't dereference expression of non-pointer type: "
@@ -427,7 +425,7 @@ def get_type(node, context, info):
                 )
         elif node.op == "&":
             node_type = get_type(node.expr, context, info)
-            return PointerType(node_type, [])
+            node_types[node] = PointerType(node_type, [])
 
     elif t == c_ast.If:
         cond_type = get_type(node.cond, context, info)
@@ -446,23 +444,23 @@ def get_type(node, context, info):
     elif t == c_ast.ID:
         # Just a variable -- check if it's in scope or not.
         try:
-            return context[node.name]
+            node_types[node] = context[node.name]
         except KeyError:
             raise TypeCheckError(node.coord, "no variable named " + node.name)
 
     elif t == c_ast.Constant:
         # Just a constant value.
         if node.type == "string":
-            return PointerType(NamedType(["char"], []), ["const"])
+            node_types[node] = PointerType(NamedType(["char"], ["const"]), [])
         else:
-            return NamedType([node.type], [])
+            node_types[node] = NamedType([node.type], [])
 
     elif t == c_ast.Cast:
-        return convert_type(node.to_type.type, info)
+        node_types[node] = convert_type(node.to_type.type, info)
 
     elif t == c_ast.Return:
         returned_type = get_type(node.expr, context, info)
-        ok, reason = assignment_okay(info['func_return'], returned_type, '<return value>', info)
+        ok, reason = assignment_okay(info['func_return'], returned_type, info)
         if not ok:
             raise TypeCheckError(
                 node.coord, "in function " + info['func_name']
@@ -479,6 +477,152 @@ def get_type(node, context, info):
     else:
         raise TypeCheckError(node.coord, "don't know how to handle node: " + str(t))
 
+    if node in node_types:
+        node_types[node] = unwrap_type(node_types[node], info)
+        return node_types[node]
+
+
+def node_repr(node):
+    """ Returns a representation of the node for use as
+        a string key in a dictionary.
+        If the node is just a variable, this is just the
+        variable name. If the node is the address of a
+        variable, etc., it will be something like '&a'.
+        If it's a struct field, it will be 'a.b', etc. """
+    if type(node) == c_ast.Cast:
+        return node_repr(node.expr)
+    elif type(node) == c_ast.UnaryOp:
+        if node.op == "*":
+            return "*" + node_repr(node.expr)
+        elif node.op == "&":
+            return "&" + node_repr(node.expr)
+    elif type(node) == c_ast.ID:
+        return node.name
+    else:
+        raise TypeCheckError(node.coord, "Can't construct node_repr for " + str(type(node)))
+
+
+def check_owners(node, precondition):
+    """ Check node for any illegal pointer usage.
+        Takes a 'precondition' parameter, a dict mapping
+        strings to pointer states.
+        Returns a 'postcondition', the set of new pointer
+        states after the operation corresponding to the
+        node. """
+    # Find the C type of the node, determined by get_type above.
+    node_type = node_types.get(node, None)
+
+    # The python class of the node.
+    t = type(node)
+
+    # The current set of pointer states. Returned at the end of the function.
+    condition = precondition.copy()
+
+    if t == c_ast.FileAST:
+        for decl in node.ext:
+            try:
+                check_owners(decl, precondition)
+            except TypeCheckError as e:
+                show_error(e)
+                continue
+
+    elif t == c_ast.FuncDef:
+        postcondition = check_owners(node.body, precondition)
+
+    elif t == c_ast.Compound:
+        condition = precondition
+
+        for stmt in node.block_items:
+            try:
+                # Update the condition with each line of the block.
+                condition = check_owners(stmt, condition)
+            except TypeCheckError as e:
+                show_error(e)
+                continue
+
+    elif t == c_ast.Decl:
+        if is_ptr(node_type):
+            if is_owned_ptr(node_type):
+                condition[node.name] = State.ZOMBIE
+            else:
+                condition[node.name] = State.UNOWNED
+
+        if node.init and is_owned_ptr(node_type):
+            condition[node.name] = State.OWNED
+            condition[node_repr(node.init)] = State.ZOMBIE
+
+    elif t == c_ast.Typedef:
+        pass
+
+    elif t == c_ast.ArrayRef:
+        # TODO
+        pass
+
+    elif t == c_ast.StructRef:
+        pass
+
+    elif t == c_ast.Assignment:
+        lval_type = node_types[node.lvalue]
+        rval_type = node_types[node.rvalue]
+
+        if is_ptr(lval_type):
+            if is_owned_ptr(lval_type):
+                if is_unowned_ptr(rval_type):
+                    raise TypeCheckError(node.coord, "Can't convert unowned ptr value "
+                                               + node_repr(node.rvalue)
+                                               + " to owned pointer in assignment.")
+                elif is_owned_ptr(rval_type):
+                    if condition[node_repr(node.lvalue)] == State.ZOMBIE:
+                        if condition[node_repr(node.rvalue)] == State.OWNED:
+                            # Move ownership from rvalue to lvalue.
+                            condition[node_repr(node.lvalue)] = State.OWNED
+                            condition[node_repr(node.rvalue)] = State.ZOMBIE
+                        else:
+                            # The rvalue was already moved somewhere else.
+                            raise TypeCheckError(node.coord, "Can't move already-moved pointer value "
+                                                   + node_repr(node.rvalue)
+                                                   + " to owned pointer in assignment.")
+                    else:
+                        # Trying to overwrite a still-owned owned pointer.
+                        raise TypeCheckError(node.coord, "Can't overwrite an owned pointer value "
+                                               + node_repr(node.rvalue)
+                                               + " without moving or freeing it first.")
+            else:
+                # Assigning to an unowned pointer, so it's fine.
+                pass
+
+    elif t == c_ast.BinaryOp:
+        pass
+
+    elif t == c_ast.UnaryOp:
+        pass
+
+    elif t == c_ast.If:
+        pass
+
+    elif t == c_ast.While or t == c_ast.DoWhile:
+        pass
+
+    elif t == c_ast.ID:
+        pass
+
+    elif t == c_ast.Constant:
+        pass
+
+    elif t == c_ast.Cast:
+        pass
+
+    elif t == c_ast.Return:
+        pass
+
+    elif t == c_ast.EmptyStatement:
+        pass
+
+    else:
+        raise TypeCheckError(node.coord, "don't know how to handle node: " + str(t))
+
+    return condition
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
@@ -490,4 +634,8 @@ if __name__ == "__main__":
         print("required: name of file to parse")
         sys.exit(1)
 
+    # We construct the dictionary mapping nodes to tags.
     get_type(ast, {}, {'typedefs': {}, 'structs': {}, 'states': {}})
+
+    # Now, we run through the AST again, checking ownership.
+    check_owners(ast, {})

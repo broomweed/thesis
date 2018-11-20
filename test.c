@@ -17,8 +17,13 @@ int blah(const int y) {
      * annotated version of malloc yet! */
     int* @owned a = (int *@owned) &e;
     int* @owned b = (int *@owned) &e;
-    /* This line correctly fails, because
-     * we haven't dealt with b yet. */
+
+    /* This fails (correctly!) because
+     * we haven't dealt with b yet.
+     * Uncommenting the extra line makes
+     * the test pass! */
+    //int* @owned c = b;
     b = a;
-    return *a;
+
+    return *b;
 }
