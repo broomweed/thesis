@@ -5,14 +5,18 @@ int main() {
 
     if (q > 0) {
         a = (int *@owned) malloc(sizeof(int));
+        b = (int *@owned) malloc(sizeof(int));
     } else {
         a = (int *@owned) malloc(sizeof(int));
         b = (int *@owned) malloc(sizeof(int));
     }
 
-    b = a;
+    while (q < 10) {
+        q++;
+        free(b);
+    }
 
-    free(b);
+    free(a);
 
     return 0;
 }

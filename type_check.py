@@ -645,10 +645,10 @@ def check_owners(node, precondition, helptext=""):
         for stmt in node.block_items:
             try:
                 # Update the condition with each line of the block.
-                print(filecontent[stmt.coord.line-1])
-                print(" (1)", condition)
+                #print(filecontent[stmt.coord.line-1])
+                #print(" (1)", condition)
                 condition = check_owners(stmt, condition, helptext)
-                print(" (2)", condition)
+                #print(" (2)", condition)
             except TypeCheckError as e:
                 show_error(e)
                 break
@@ -697,8 +697,8 @@ def check_owners(node, precondition, helptext=""):
         after_loop = check_owners(node.cond, after_loop, helptext + "in first iteration of do/while loop: ")
 
         # and then possibly run it again -- has to work under both conditions
-        loop_again = check_owners(node.stmt, after_loop, helptext + "in second iteration of do/while loop: ")
-        loop_again = check_owners(node.cond, loop_again, helptext + "in second iteration of do/while loop: ")
+        loop_again = check_owners(node.stmt, after_loop, helptext + "when running do/while loop again: ")
+        loop_again = check_owners(node.cond, loop_again, helptext + "when running do/while loop again: ")
 
         condition = unify_conditions(loop_again, after_loop)
 
@@ -708,8 +708,8 @@ def check_owners(node, precondition, helptext=""):
         after_loop = check_owners(node.stmt, after_loop, helptext + "in first iteration of while loop: ")
 
         # and then possibly run it again
-        loop_again = check_owners(node.cond, after_loop, helptext + "in second iteration of while loop: ")
-        loop_again = check_owners(node.stmt, loop_again, helptext + "in second iteration of while loop: ")
+        loop_again = check_owners(node.cond, after_loop, helptext + "when running while loop again: ")
+        loop_again = check_owners(node.stmt, loop_again, helptext + "when running while loop again: ")
 
         # The final one is the unification of running the loop and not running the loop, since
         # with a while loop we might skip over it entirely
@@ -742,7 +742,21 @@ def check_owners(node, precondition, helptext=""):
         pass
 
     elif t == c_ast.Return:
-        pass
+        if is_ptr(node_types[node.expr]):
+            if is_lvalue(node.expr):
+                # TODO Check ownership matches function return expectation.
+                condition[node_repr(node.expr)] = State.ZOMBIE
+
+        for var in condition:
+            if condition[var] not in {State.UNOWNED, State.ZOMBIE, State.UNINIT}:
+                if condition[var] == State.MAYBEINIT:
+                    explanation = "possibly contains an owned pointer value, which could leak"
+                elif condition[var] == State.UNKNOWN:
+                    explanation = "possibly contains an owned pointer value, which could leak"
+                elif condition[var] == State.OWNED:
+                    explanation = "still contains an owned pointer value, which will leak"
+                raise TypeCheckError(node.coord, helptext + "at return, pointer value "
+                                        + var + " " + explanation + ".")
 
     elif t == c_ast.FuncCall:
         # TODO Handle arbitrary func. calls
