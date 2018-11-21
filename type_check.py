@@ -502,6 +502,17 @@ def node_repr(node):
         raise TypeCheckError(node.coord, "Can't construct node_repr for " + str(type(node)))
 
 
+def is_lvalue(node):
+    if type(node) in {c_ast.ID, c_ast.ArrayRef, c_ast.StructRef}:
+        return True
+    if type(node) == UnaryOp:
+        if node.op == "*":
+            return is_lvalue(node.expr)
+        else:
+            return False
+    return False
+
+
 def check_owners(node, precondition):
     """ Check node for any illegal pointer usage.
         Takes a 'precondition' parameter, a dict mapping
@@ -535,7 +546,10 @@ def check_owners(node, precondition):
         for stmt in node.block_items:
             try:
                 # Update the condition with each line of the block.
+                print(filecontent[stmt.coord.line - 1])
+                print(condition, end='')
                 condition = check_owners(stmt, condition)
+                print(" >>", condition)
             except TypeCheckError as e:
                 show_error(e)
                 continue
@@ -559,6 +573,7 @@ def check_owners(node, precondition):
         pass
 
     elif t == c_ast.StructRef:
+        # TODO
         pass
 
     elif t == c_ast.Assignment:
@@ -566,13 +581,23 @@ def check_owners(node, precondition):
         rval_type = node_types[node.rvalue]
 
         if is_ptr(lval_type):
+            # Assignment is never OK when the right-side pointer is a zombie.
+            if is_lvalue(node.rvalue) and condition[node_repr(node.rvalue)] == State.ZOMBIE:
+                raise TypeCheckError(node.coord, "Can't use the value of the owned pointer "
+                                                   + node_repr(node.rvalue)
+                                                   + ", which is uninitialized, moved or freed.")
             if is_owned_ptr(lval_type):
                 if is_unowned_ptr(rval_type):
-                    raise TypeCheckError(node.coord, "Can't convert unowned ptr value "
-                                               + node_repr(node.rvalue)
-                                               + " to owned pointer in assignment.")
+                    if is_lvalue(node.rvalue):
+                        raise TypeCheckError(node.coord, "Can't convert unowned ptr value "
+                                             + node_repr(node.rvalue)
+                                             + " to owned pointer in assignment.")
+                    else:
+                        raise TypeCheckError(node.coord, "Can't assign to owned pointer from non-lvalue.")
                 elif is_owned_ptr(rval_type):
+                    # If the node being assigned to currently doesn't have a valid value....
                     if condition[node_repr(node.lvalue)] == State.ZOMBIE:
+                        # and the node being assigned DOES have a valid value...
                         if condition[node_repr(node.rvalue)] == State.OWNED:
                             # Move ownership from rvalue to lvalue.
                             condition[node_repr(node.lvalue)] = State.OWNED
@@ -587,12 +612,10 @@ def check_owners(node, precondition):
                         raise TypeCheckError(node.coord, "Can't overwrite an owned pointer value "
                                                + node_repr(node.rvalue)
                                                + " without moving or freeing it first.")
-            else:
-                # Assigning to an unowned pointer, so it's fine.
-                pass
 
     elif t == c_ast.BinaryOp:
-        pass
+        if is_owned_ptr(node_types[node.left]):
+            raise TypeCheckError("pointer arithmetic not permitted on owned pointer " + node_repr(node.left))
 
     elif t == c_ast.UnaryOp:
         pass

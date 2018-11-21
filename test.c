@@ -11,7 +11,6 @@ const int x;
 int blah(const int y) {
     blorp @owned z;
     bloop* x;
-    x = z;
     int e = 4;
     /* This is bad but I don't have an
      * annotated version of malloc yet! */
@@ -22,7 +21,7 @@ int blah(const int y) {
      * we haven't dealt with b yet.
      * Uncommenting the extra line makes
      * the test pass! */
-    //int* @owned c = b;
+    int* @owned c = b;
     b = a;
 
     return *b;
