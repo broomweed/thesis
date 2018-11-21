@@ -585,7 +585,8 @@ def check_owners(node, precondition, helptext=""):
 
         if node.init and is_owned_ptr(node_type):
             condition[node.name] = State.OWNED
-            condition[node_repr(node.init)] = State.ZOMBIE
+            if is_lvalue(node.init):
+                condition[node_repr(node.init)] = State.ZOMBIE
 
     elif t == c_ast.Typedef:
         pass
