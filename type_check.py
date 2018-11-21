@@ -577,12 +577,13 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
             if is_unowned_ptr(rval_type):
                 if is_lvalue(rvalue):
                     condition[lval_name] = State.OWNED
-                    raise TypeCheckError(coord, helptext + "Can't convert unowned ptr value "
+                    raise TypeCheckError(coord, helptext + "Can't store unowned pointer value "
                                          + node_repr(rvalue)
-                                         + " to owned pointer in assignment.")
+                                         + " in owned pointer variable "
+                                         + lval_name + ".")
                 else:
-                    # TODO, This isn't actually true -- we should be able to put function return values into owned ptrs.
-                    raise TypeCheckError(coord, helptext + "Can't assign to owned pointer from non-lvalue.")
+                    raise TypeCheckError(coord, helptext
+                                         + "Can't assign an unowned pointer value to owned pointer variable " + lval_name + ".")
             elif is_owned_ptr(rval_type):
                 # If the node being assigned to currently doesn't have a valid value....
                 if condition[lval_name] in {State.ZOMBIE, State.UNINIT}:
@@ -685,10 +686,10 @@ def check_owners(node, precondition, helptext=""):
         check_assignment(node_repr(node.lvalue), node.rvalue, lval_type, rval_type, condition, node.coord, helptext)
 
     elif t == c_ast.BinaryOp:
-        if is_owned_ptr(node_types[node.left]) and node.op != "==":
-            raise TypeCheckError(node.coord, helptext + "arithmetic not permitted on owned pointer " + node_repr(node.left))
+        pass
 
     elif t == c_ast.UnaryOp:
+        # TODO Forbid 'p++' etc. on owned pointers
         pass
 
     elif t == c_ast.DoWhile:
