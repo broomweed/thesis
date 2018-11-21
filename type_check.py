@@ -249,7 +249,7 @@ def get_type(node, context, info):
     t = type(node)
 
     if t == c_ast.FileAST:
-        print(node)
+        #print(node)
         for decl in node.ext:
             try:
                 get_type(decl, context, info)
@@ -390,11 +390,6 @@ def get_type(node, context, info):
         var_type = get_type(node.lvalue, context, info)
         expr_type = get_type(node.rvalue, context, info)
 
-        print("Assignment: " + expand_type_name(var_type, info) + " to " + expand_type_name(expr_type, info))
-        print(filecontent[node.coord.line - 1])
-        print(str(is_owned_ptr(var_type, info)), "->", str(is_owned_ptr(expr_type, info)))
-
-        # TODO This will fail when the lvalue is not a bare variable name!
         ok, reason = assignment_okay(var_type, expr_type, info)
         if not ok:
             raise TypeCheckError(
@@ -546,10 +541,7 @@ def check_owners(node, precondition):
         for stmt in node.block_items:
             try:
                 # Update the condition with each line of the block.
-                print(filecontent[stmt.coord.line - 1])
-                print(condition, end='')
                 condition = check_owners(stmt, condition)
-                print(" >>", condition)
             except TypeCheckError as e:
                 show_error(e)
                 continue
@@ -609,8 +601,8 @@ def check_owners(node, precondition):
                                                    + " to owned pointer in assignment.")
                     else:
                         # Trying to overwrite a still-owned owned pointer.
-                        raise TypeCheckError(node.coord, "Can't overwrite an owned pointer value "
-                                               + node_repr(node.rvalue)
+                        raise TypeCheckError(node.coord, "Can't overwrite the owned pointer value "
+                                               + node_repr(node.lvalue)
                                                + " without moving or freeing it first.")
 
     elif t == c_ast.BinaryOp:
