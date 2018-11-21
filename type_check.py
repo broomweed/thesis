@@ -12,6 +12,8 @@ class State(Enum):
     # uninitialized or free; the 'zombie' name is from the POM paper
     ZOMBIE = 1
     OWNED = 2
+    # possibly owned or zombie; the union of both, for when we unify states.
+    UNKNOWN = 3
 
 class TypeCheckError(Exception):
     def __init__(self, location, msg):
@@ -466,6 +468,12 @@ def get_type(node, context, info):
                           + ": " + reason
             )
 
+    elif t == c_ast.FuncCall:
+        # TODO Handle function calls.
+        for param in node.args.exprs:
+            # We'll deal with this later...
+            get_type(param, context, info)
+
     elif t == c_ast.EmptyStatement:
         pass
 
@@ -494,13 +502,13 @@ def node_repr(node):
     elif type(node) == c_ast.ID:
         return node.name
     else:
-        raise TypeCheckError(node.coord, "Can't construct node_repr for " + str(type(node)))
+        raise ValueError(str(node.coord.line) + "Can't construct node_repr for " + str(type(node)))
 
 
 def is_lvalue(node):
     if type(node) in {c_ast.ID, c_ast.ArrayRef, c_ast.StructRef}:
         return True
-    if type(node) == UnaryOp:
+    if type(node) == c_ast.UnaryOp:
         if node.op == "*":
             return is_lvalue(node.expr)
         else:
@@ -508,7 +516,26 @@ def is_lvalue(node):
     return False
 
 
-def check_owners(node, precondition):
+def unify_conditions(c1, c2):
+    """ Given two preconditions, find the 'union'
+        of them. (However, the set of variables in
+        it is actually the intersection of the
+        variables in both, since we don't care
+        about any new variables introduced within
+        a block.) """
+    new_cond = {}
+
+    for var in c1:
+        if var in c2:
+            if c1[var] == c2[var]:
+                new_cond[var] = c1[var]
+            else:
+                new_cond[var] = State.UNKNOWN
+
+    return new_cond
+
+
+def check_owners(node, precondition, helptext=""):
     """ Check node for any illegal pointer usage.
         Takes a 'precondition' parameter, a dict mapping
         strings to pointer states.
@@ -527,13 +554,13 @@ def check_owners(node, precondition):
     if t == c_ast.FileAST:
         for decl in node.ext:
             try:
-                check_owners(decl, precondition)
+                check_owners(decl, precondition, helptext)
             except TypeCheckError as e:
                 show_error(e)
                 continue
 
     elif t == c_ast.FuncDef:
-        postcondition = check_owners(node.body, precondition)
+        postcondition = check_owners(node.body, precondition, helptext)
 
     elif t == c_ast.Compound:
         condition = precondition
@@ -541,7 +568,10 @@ def check_owners(node, precondition):
         for stmt in node.block_items:
             try:
                 # Update the condition with each line of the block.
-                condition = check_owners(stmt, condition)
+                #print(filecontent[stmt.coord.line-1])
+                #print(condition, end='')
+                condition = check_owners(stmt, condition, helptext)
+                #print(" >>", condition)
             except TypeCheckError as e:
                 show_error(e)
                 continue
@@ -575,39 +605,46 @@ def check_owners(node, precondition):
         if is_ptr(lval_type):
             # Assignment is never OK when the right-side pointer is a zombie.
             if is_lvalue(node.rvalue) and condition[node_repr(node.rvalue)] == State.ZOMBIE:
-                raise TypeCheckError(node.coord, "Can't use the value of the owned pointer "
+                raise TypeCheckError(node.coord, helptext + "Can't assign from the value of the owned pointer "
                                                    + node_repr(node.rvalue)
                                                    + ", which is uninitialized, moved or freed.")
+            if is_lvalue(node.rvalue) and condition[node_repr(node.rvalue)] == State.UNKNOWN:
+                raise TypeCheckError(node.coord, helptext + "Can't assign from the value of the owned pointer "
+                                                   + node_repr(node.rvalue)
+                                                   + ", which might be uninitialized, moved or freed.")
             if is_owned_ptr(lval_type):
                 if is_unowned_ptr(rval_type):
                     if is_lvalue(node.rvalue):
-                        raise TypeCheckError(node.coord, "Can't convert unowned ptr value "
+                        raise TypeCheckError(node.coord, helptext + "Can't convert unowned ptr value "
                                              + node_repr(node.rvalue)
                                              + " to owned pointer in assignment.")
                     else:
-                        raise TypeCheckError(node.coord, "Can't assign to owned pointer from non-lvalue.")
+                        raise TypeCheckError(node.coord, helptext + "Can't assign to owned pointer from non-lvalue.")
                 elif is_owned_ptr(rval_type):
                     # If the node being assigned to currently doesn't have a valid value....
                     if condition[node_repr(node.lvalue)] == State.ZOMBIE:
-                        # and the node being assigned DOES have a valid value...
-                        if condition[node_repr(node.rvalue)] == State.OWNED:
+                        # and the node being assigned DOES have a valid value... (or it's, like, a function return value)
+                        if not is_lvalue(node.rvalue) or condition[node_repr(node.rvalue)] == State.OWNED:
                             # Move ownership from rvalue to lvalue.
                             condition[node_repr(node.lvalue)] = State.OWNED
-                            condition[node_repr(node.rvalue)] = State.ZOMBIE
+                            if is_lvalue(node.rvalue):
+                                condition[node_repr(node.rvalue)] = State.ZOMBIE
                         else:
-                            # The rvalue was already moved somewhere else.
-                            raise TypeCheckError(node.coord, "Can't move already-moved pointer value "
-                                                   + node_repr(node.rvalue)
-                                                   + " to owned pointer in assignment.")
+                            # The rvalue was already moved somewhere else. (or its status is unknown)
+                            raise TypeCheckError(node.coord, helptext + "Can't move pointer value "
+                                               + node_repr(node.rvalue) + " to owned pointer in assignment; it has"
+                                               + (" possibly" if condition[node_repr(node.rvalue)] == State.UNKNOWN else "")
+                                               + " already been moved.")
                     else:
-                        # Trying to overwrite a still-owned owned pointer.
-                        raise TypeCheckError(node.coord, "Can't overwrite the owned pointer value "
-                                               + node_repr(node.lvalue)
-                                               + " without moving or freeing it first.")
+                        # Trying to overwrite a possibly-still-owned owned pointer.
+                        raise TypeCheckError(node.coord, helptext + "Can't overwrite the owned pointer value "
+                                               + node_repr(node.lvalue) + "; it "
+                                               + ("possibly " if condition[node_repr(node.lvalue)] == State.UNKNOWN else "")
+                                               + "still contains a non-freed or non-moved value.")
 
     elif t == c_ast.BinaryOp:
         if is_owned_ptr(node_types[node.left]):
-            raise TypeCheckError("pointer arithmetic not permitted on owned pointer " + node_repr(node.left))
+            raise TypeCheckError(helptext + "pointer arithmetic not permitted on owned pointer " + node_repr(node.left))
 
     elif t == c_ast.UnaryOp:
         pass
@@ -615,8 +652,21 @@ def check_owners(node, precondition):
     elif t == c_ast.If:
         pass
 
-    elif t == c_ast.While or t == c_ast.DoWhile:
+    elif t == c_ast.While:
         pass
+
+    elif t == c_ast.DoWhile:
+        # Run the loop once...
+        after_loop = check_owners(node.stmt, condition, helptext)
+        after_loop = check_owners(node.cond, after_loop, helptext + "[on condition of do/while] ")
+
+        # and then possibly run it again -- has to work under both conditions
+        unified = unify_conditions(condition, after_loop)
+
+        loop_again = check_owners(node.stmt, unified, helptext + "[on second iteration of do/while] ")
+        loop_again = check_owners(node.cond, loop_again, helptext + "[on second condition of do/while] ")
+
+        condition = loop_again
 
     elif t == c_ast.ID:
         pass
@@ -629,6 +679,22 @@ def check_owners(node, precondition):
 
     elif t == c_ast.Return:
         pass
+
+    elif t == c_ast.FuncCall:
+        # TODO Handle arbitrary func. calls
+        if node.name.name == "free":
+            if is_owned_ptr(node_types[node.args.exprs[0]]):
+                if condition[node_repr(node.args.exprs[0])] == State.OWNED:
+                    condition[node_repr(node.args.exprs[0])] = State.ZOMBIE
+                else:
+                    raise TypeCheckError(node.coord, helptext + "can't free pointer "
+                                            + node_repr(node.args.exprs[0])
+                                            + ", which was already "
+                                            + ("possibly " if condition[node_repr(node.args.exprs[0])] == State.UNKNOWN else "")
+                                            + "freed or moved."
+                                        )
+            else:
+                raise TypeCheckError(node.coord, helptext + "can't free unowned pointer.")
 
     elif t == c_ast.EmptyStatement:
         pass
@@ -649,6 +715,7 @@ if __name__ == "__main__":
         print("required: name of file to parse")
         sys.exit(1)
 
+    #print(ast)
     # We construct the dictionary mapping nodes to tags.
     get_type(ast, {}, {'typedefs': {}, 'structs': {}, 'states': {}})
 

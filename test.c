@@ -19,9 +19,9 @@ int blah(const int y) {
 
     /* This fails (correctly!) because
      * we haven't dealt with b yet.
-     * Uncommenting the extra line makes
-     * the test pass! */
-    int* @owned c = b;
+     * Adding "@owned" to c's type signature
+     * makes the test pass! */
+    int* c = b;
     b = a;
 
     return *b;
