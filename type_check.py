@@ -248,11 +248,14 @@ def show_error(e):
 
 
 node_types = {}
+error_in_typecheck_phase = False
 
 def get_type(node, context, info):
     """ Walks over the pycparser-generated AST.
         Checks that a statement has correct type, and also returns
         types of expressions. """
+    global error_in_typecheck_phase
+
     t = type(node)
 
     if t == c_ast.FileAST:
@@ -261,6 +264,7 @@ def get_type(node, context, info):
             try:
                 get_type(decl, context, info)
             except TypeCheckError as e:
+                error_in_typecheck_phase = True
                 show_error(e)
                 continue
 
@@ -288,6 +292,7 @@ def get_type(node, context, info):
             try:
                 get_type(stmt, block_context, info)
             except TypeCheckError as e:
+                error_in_typecheck_phase = True
                 show_error(e)
                 continue
 
@@ -540,9 +545,13 @@ def unify_conditions(c1, c2):
                   or c1[var] == State.ZOMBIE and c2[var] == State.UNINIT):
                 # If uninitialized or zombie, it doesn't really matter.
                 new_cond[var] = State.ZOMBIE
-            elif c1[var] == State.UNINIT or c2[var] == State.UNINIT:
+            elif State.UNINIT in {c1[var], c2[var]}:
                 # Otherwise, if it's maybe uninitialized or maybe valid,
                 # that's really bad.
+                new_cond[var] = State.MAYBEINIT
+            elif State.MAYBEINIT in {c1[var], c2[var]} and State.ZOMBIE not in {c1[var], c2[var]}:
+                # If it's maybe initialized but definitely not a zombie,
+                # that's bad
                 new_cond[var] = State.MAYBEINIT
             else:
                 # Also if we're not sure it's a zombie or not. That's
@@ -560,9 +569,9 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
             rval_cond = condition[node_repr(rvalue)]
             if rval_cond not in {State.OWNED, State.UNOWNED}:
                 if rval_cond == State.UNINIT:
-                    explanation = ", which is not yet initialized."
+                    explanation = ", which is not initialized."
                 if rval_cond == State.MAYBEINIT:
-                    explanation = ", which might not yet be initialized."
+                    explanation = ", which might not be initialized."
                 if rval_cond == State.ZOMBIE:
                     explanation = ", which was already moved or freed."
                 if rval_cond == State.UNKNOWN:
@@ -571,6 +580,8 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
                 # Just propagate the error along, so we don't crash later
                 # and can get more errors to print out.
                 condition[lval_name] = rval_cond
+                if rval_cond != State.UNOWNED:
+                    condition[node_repr(rvalue)] = State.ZOMBIE
                 raise TypeCheckError(coord, helptext + "Can't assign from the value of the owned pointer "
                                            + node_repr(rvalue) + explanation)
         if is_owned_ptr(lval_type):
@@ -582,6 +593,8 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
                                          + " in owned pointer variable "
                                          + lval_name + ".")
                 else:
+                    # Update condition as though error didn't happen -- in case we have more errors later
+                    condition[lval_name] = State.OWNED
                     raise TypeCheckError(coord, helptext
                                          + "Can't assign an unowned pointer value to owned pointer variable " + lval_name + ".")
             elif is_owned_ptr(rval_type):
@@ -605,9 +618,10 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
                         raise TypeCheckError(coord, helptext + "Can't move pointer value "
                                            + node_repr(rvalue) + " to owned pointer in assignment; it has"
                                            + (" possibly" if condition[node_repr(rvalue)] == State.MAYBEINIT else "")
-                                           + " not yet been initialized.")
+                                           + " not been initialized.")
                 else:
                     # Trying to overwrite a possibly-still-owned owned pointer.
+                    condition[lval_name] = State.OWNED
                     raise TypeCheckError(coord, helptext + "Can't overwrite the owned pointer value "
                                            + lval_name + "; it has "
                                            + ("possibly " if condition[lval_name] == State.MAYBEINIT else "")
@@ -628,31 +642,33 @@ def check_owners(node, precondition, helptext=""):
     t = type(node)
 
     # The current set of pointer states. Returned at the end of the function.
-    condition = precondition.copy()
+    condition = precondition
 
     if t == c_ast.FileAST:
+        condition = precondition.copy()
+
         for decl in node.ext:
             try:
-                check_owners(decl, precondition, helptext)
+                check_owners(decl, condition, helptext)
             except TypeCheckError as e:
                 show_error(e)
 
     elif t == c_ast.FuncDef:
-        postcondition = check_owners(node.body, precondition, helptext)
+        postcondition = check_owners(node.body, condition.copy(), helptext)
 
     elif t == c_ast.Compound:
-        condition = precondition
+        condition = condition.copy()
 
         for stmt in node.block_items:
+            #print(" (1)", condition)
+            #print(filecontent[stmt.coord.line-1])
             try:
                 # Update the condition with each line of the block.
-                #print(filecontent[stmt.coord.line-1])
-                #print(" (1)", condition)
                 condition = check_owners(stmt, condition, helptext)
-                #print(" (2)", condition)
             except TypeCheckError as e:
                 show_error(e)
-                break
+            #print(" (2)", condition)
+            #print()
 
     elif t == c_ast.Decl:
         if is_ptr(node_type):
@@ -724,7 +740,8 @@ def check_owners(node, precondition, helptext=""):
         after_then = check_owners(node.iftrue, after_cond, helptext)
 
         # Check the false branch of the if - or if it doesn't exist,
-        # use the starting condition as the "after else" thing
+        # use the starting condition as the "after else" condition
+        # (since nothing will change if the if's condition is false)
         if node.iffalse is not None:
             after_else = check_owners(node.iffalse, after_cond, helptext)
         else:
@@ -751,11 +768,11 @@ def check_owners(node, precondition, helptext=""):
         for var in condition:
             if condition[var] not in {State.UNOWNED, State.ZOMBIE, State.UNINIT}:
                 if condition[var] == State.MAYBEINIT:
-                    explanation = "possibly contains an owned pointer value, which could leak"
+                    explanation = "was possibly initialized with an owned pointer value, which could leak here"
                 elif condition[var] == State.UNKNOWN:
-                    explanation = "possibly contains an owned pointer value, which could leak"
+                    explanation = "possibly contains a non-freed owned pointer value, which could leak here"
                 elif condition[var] == State.OWNED:
-                    explanation = "still contains an owned pointer value, which will leak"
+                    explanation = "still contains an owned pointer value, which will leak here"
                 raise TypeCheckError(node.coord, helptext + "at return, pointer value "
                                         + var + " " + explanation + ".")
 
@@ -767,17 +784,19 @@ def check_owners(node, precondition, helptext=""):
                 if ptr_cond == State.OWNED:
                     condition[node_repr(node.args.exprs[0])] = State.ZOMBIE
                 elif ptr_cond in {State.ZOMBIE, State.UNKNOWN}:
+                    condition[node_repr(node.args.exprs[0])] = State.ZOMBIE
                     raise TypeCheckError(node.coord, helptext + "Can't free pointer "
                                             + node_repr(node.args.exprs[0])
                                             + ", which was already "
-                                            + ("possibly " if condition[node_repr(node.args.exprs[0])] == State.UNKNOWN else "")
+                                            + ("possibly " if ptr_cond == State.UNKNOWN else "")
                                             + "freed or moved."
                                         )
                 elif ptr_cond in {State.UNINIT, State.MAYBEINIT}:
+                    condition[node_repr(node.args.exprs[0])] = State.ZOMBIE
                     raise TypeCheckError(node.coord, helptext + "Can't free pointer "
                                             + node_repr(node.args.exprs[0])
                                             + ", which "
-                                            + ("might not be " if condition[node_repr(node.args.exprs[0])] == State.MAYBEINIT else "is not yet ")
+                                            + ("might not be " if ptr_cond == State.MAYBEINIT else "is not ")
                                             + "initialized."
                                         )
             else:
@@ -806,5 +825,6 @@ if __name__ == "__main__":
     # We construct the dictionary mapping nodes to tags.
     get_type(ast, {}, {'typedefs': {}, 'structs': {}, 'states': {}})
 
-    # Now, we run through the AST again, checking ownership.
-    check_owners(ast, {})
+    if not error_in_typecheck_phase:
+        # Now, we run through the AST again, checking ownership.
+        check_owners(ast, {})

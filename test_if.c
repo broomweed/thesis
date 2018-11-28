@@ -13,10 +13,11 @@ int main() {
 
     while (q < 10) {
         q++;
-        free(b);
+        //free(b);
     }
 
     free(a);
+    free(b);
 
     return 0;
 }

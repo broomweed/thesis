@@ -9,5 +9,6 @@ int main() {
     }
 
     int *@owned a = x;
+    free(a);
     return 2;
 }
