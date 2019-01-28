@@ -109,8 +109,8 @@ def is_unowned_ptr(t, info=None):
 
 
 def convert_type(node, info):
+    """ Convert a c_ast type node to a Type object. """
     def recurse(node, info, quals):
-        """ Convert a c_ast type node to a Type object. """
         t = type(node)
 
         if t == c_ast.PtrDecl:
@@ -248,6 +248,7 @@ def show_error(e):
 
 
 node_types = {}
+function_types = {}
 error_in_typecheck_phase = False
 
 def get_type(node, context, info):
@@ -278,10 +279,21 @@ def get_type(node, context, info):
         # add things to the context.
         func_context = context.copy()
 
+        # Build the list of function parameters and their types,
+        # so we can later check them when a function gets called.
+        func_params = []
+
         if node.decl.type.args is not None:
             for param in node.decl.type.args.params:
-                # Put parameters into function scope.
-                get_type(param, func_context, info_with_return)
+                # Put parameters into function scope, by parsing them
+                # as declarations.
+                param_type = get_type(param, func_context, info_with_return)
+                # Also, save what type of parameters are expected by the
+                # function so we can check it if it's called later.
+                func_params.append((param.name, param_type))
+
+        # Save function return types and argument types.
+        function_types[node.decl.name] = (info_with_return['func_return'], func_params)
 
         get_type(node.body, func_context, info_with_return)
 
@@ -481,10 +493,29 @@ def get_type(node, context, info):
             )
 
     elif t == c_ast.FuncCall:
-        # TODO Handle function calls.
-        for param in node.args.exprs:
-            # We'll deal with this later...
-            get_type(param, context, info)
+        func_type = function_types[node.name.name]
+        return_type = func_type[0]
+        param_names = [a[0] for a in func_type[1]]
+        param_types = [a[1] for a in func_type[1]]
+
+        for index, param in enumerate(node.args.exprs):
+            # Make sure all the parameters match in type
+            param_type = get_type(param, context, info)
+            # use initialization_okay because it's okay to pass a non-const
+            # to a const parameter
+            if not initialization_okay(param_type, param_types[index], info):
+                raise TypeCheckError(
+                    param.coord, "parameter #" + str(index+1)
+                               + " (‘" + param_names[index]
+                               + "’) to function " + node.name.name
+                               + " expects type " + expand_type_name(param_types[index], info)
+                               + ", but was passed an expression of type "
+                               + expand_type_name(param_type, info) + " instead."
+                )
+
+        # If we made it and all the parameters match,
+        # then we get a value of the function's return type.
+        return return_type
 
     elif t == c_ast.EmptyStatement:
         pass
@@ -821,7 +852,6 @@ if __name__ == "__main__":
         print("required: name of file to parse")
         sys.exit(1)
 
-    #print(ast)
     # We construct the dictionary mapping nodes to tags.
     get_type(ast, {}, {'typedefs': {}, 'structs': {}, 'states': {}})
 
