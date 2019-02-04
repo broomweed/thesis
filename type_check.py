@@ -493,6 +493,18 @@ def get_type(node, context, info):
             )
 
     elif t == c_ast.FuncCall:
+        if node.name.name == "free" or node.name.name == "malloc":
+            # Skip this, since we can't check it anyway
+            # (we don't handle void* right now)
+            # and pycparser chokes on <stdlib.h>. So we just
+            # special-case free() and malloc().
+            for param in node.args.exprs:
+                # But we still have to mark each node with its type,
+                # or else it'll choke later when it tries to see what
+                # types the parameters to free() had.
+                get_type(param, context, info)
+            return None
+
         func_type = function_types[node.name.name]
         return_type = func_type[0]
         param_names = [a[0] for a in func_type[1]]
@@ -515,6 +527,8 @@ def get_type(node, context, info):
 
         # If we made it and all the parameters match,
         # then we get a value of the function's return type.
+
+        node_types[node] = return_type
         return return_type
 
     elif t == c_ast.EmptyStatement:
@@ -685,7 +699,18 @@ def check_owners(node, precondition, helptext=""):
                 show_error(e)
 
     elif t == c_ast.FuncDef:
-        postcondition = check_owners(node.body, condition.copy(), helptext)
+        precondition = condition.copy()
+        for param in node.decl.type.args.params:
+            paramtype = node_types[param]
+            if is_ptr(paramtype):
+                # Assume ownership was handled correctly outside the function.
+                # If it isn't, we'll catch it when the function is called.
+                if is_owned_ptr(paramtype):
+                    precondition[param.name] = State.OWNED
+                else:
+                    precondition[param.name] = State.UNOWNED
+
+        postcondition = check_owners(node.body, precondition, helptext)
 
     elif t == c_ast.Compound:
         condition = condition.copy()
@@ -709,6 +734,9 @@ def check_owners(node, precondition, helptext=""):
                 condition[node.name] = State.UNOWNED
 
         if node.init is not None:
+            # Right side might be a function call, so we have to evaluate its ownership as well.
+            check_owners(node.init, condition)
+
             init_type = node_types[node.init]
             check_assignment(node.name, node.init, node_type, init_type, condition, node.coord, helptext)
 
@@ -728,6 +756,10 @@ def check_owners(node, precondition, helptext=""):
             raise TypeCheckError(node.coord, "We don't yet handle assignment other than =.")
 
         lval_type = node_types[node.lvalue]
+
+        # Right side might be a function call, so we have to evaluate its ownership as well.
+        check_owners(node.rvalue)
+
         rval_type = node_types[node.rvalue]
 
         check_assignment(node_repr(node.lvalue), node.rvalue, lval_type, rval_type, condition, node.coord, helptext)
@@ -808,8 +840,9 @@ def check_owners(node, precondition, helptext=""):
                                         + var + " " + explanation + ".")
 
     elif t == c_ast.FuncCall:
-        # TODO Handle arbitrary func. calls
         if node.name.name == "free":
+            # "free" is special-cased here, but in a full implementation, we would also support
+            # marking function parameters as "gets freed by this function."
             if is_owned_ptr(node_types[node.args.exprs[0]]):
                 ptr_cond = condition[node_repr(node.args.exprs[0])]
                 if ptr_cond == State.OWNED:
@@ -832,6 +865,48 @@ def check_owners(node, precondition, helptext=""):
                                         )
             else:
                 raise TypeCheckError(node.coord, helptext + "Can't free unowned pointer.")
+        else:
+            # Regular function call. Check that ownership matches its parameter expectations.
+            for index, arg in enumerate(node.args.exprs):
+                param_name, expected_param_type = function_types[node.name.name][1][index]
+
+                if is_ptr(node_types[arg]):
+                    if is_owned_ptr(node_types[arg]):
+                        if is_owned_ptr(expected_param_type):
+                            # Owned -> owned. OK only if we're sure our argument is already owned.
+                            ptr_cond = condition[node_repr(arg)]
+                            if ptr_cond == State.OWNED:
+                                # Great! Transfer ownership to the function.
+                                condition[node_repr(arg)] = State.ZOMBIE
+                            elif ptr_cond in {State.ZOMBIE, State.UNKNOWN}:
+                                condition[node_repr(arg)] = State.ZOMBIE
+                                raise TypeCheckError(arg.coord, helptext + "Can't pass "
+                                                        + node_repr(arg) + " as owned parameter '"
+                                                        + param_name + "' to function "
+                                                        + node.name.name + ", since it "
+                                                        + (" might have been " if ptr_cond == State.UNKNOWN else " was ")
+                                                        + " already freed.")
+                            elif ptr_cond in {State.UNINIT, State.MAYBEINIT}:
+                                condition[node_repr(arg)] = State.ZOMBIE
+                                raise TypeCheckError(arg.coord, helptext + "Can't pass "
+                                                        + node_repr(arg) + " as owned parameter '"
+                                                        + param_name + "' to function "
+                                                        + node.name.name + ", since it "
+                                                        + (" might not be " if ptr_cond == State.UNKNOWN else " isn't ")
+                                                        + " initialized yet.")
+                        else:
+                            # Owned -> unowned. That's fine too -- we just don't transfer ownership.
+                            pass
+                    else:
+                        if is_owned_ptr(expected_param_type):
+                            # Unowned -> owned. Not okay.
+                            raise TypeCheckError(arg.coord, helptext + "Can't pass unowned pointer "
+                                                     + node_repr(arg) + " as parameter '"
+                                                     + param_name + "' to function "
+                                                     + node.name.name + ", which expects an owned pointer argument.")
+                        else:
+                            # Unowned -> unowned. Fine.
+                            pass
 
     elif t == c_ast.EmptyStatement:
         pass
