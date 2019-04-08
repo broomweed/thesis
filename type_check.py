@@ -98,10 +98,35 @@ def is_owned_ptr(t, info=None):
         (This is necessary because t might be a typedef
         that has '@owned' in its own qualifications, but not
         in the qualifications of the actual pointer type.)
-        (They might be at different nested typedefs, for example.) """
+        (They might be at different nested typedefs, for example.)
+        Also, the '@frees' qualifier marks that a function frees
+        its parameter, rather than passing it off somewhere. """
+
     if info is None:
-        return type(t) == PointerType and '@owned' in t.quals
-    return is_ptr(t, info) and '@owned' in unwrap_type(t, info).quals
+        return type(t) == PointerType and ('@owned' in t.quals or '@frees' in t.quals)
+
+    return is_ptr(t, info) and (
+        '@owned' in unwrap_type(t, info).quals or '@frees' in unwrap_type(t, info).quals
+    )
+
+
+def get_final_state(t, info=None):
+    """ For a given type that a function parameter might
+        have, return the type we want it to have when we
+        leave a function. (If the parameter has '@frees',
+        we want it to be freed; if it has '@owned', we
+        want it to be unowned; otherwise, it's not an owned
+        pointer, so we want it to be unowned. """
+    if is_ptr(t, info):
+        if is_owned_ptr(t, info):
+            if '@frees' in unwrap_type(t, info).quals:
+                return State.ZOMBIE
+            elif '@owned' in unwrap_type(t, info).quals:
+                return State.UNOWNED
+        else:
+            return State.UNOWNED
+    else:
+        return None
 
 
 def is_unowned_ptr(t, info=None):
@@ -126,8 +151,9 @@ def convert_type(node, info):
                 # Declaring struct type
                 # (If we don't hit this if-branch, we're declaring a variable
                 #  with the struct type instead.)
-                # NOTE: I think this will fail if we have like 'struct X;'
-                # alone on its own line. But unsure if this matters that much.
+                # NOTE: this will likely fail if we have like 'struct X;'
+                # alone on its own line.
+                # This is a shortcut I'm willing to take, for now.
                 fields = {}
                 field_order = []
                 for decl in node.decls:
@@ -176,7 +202,7 @@ def initialization_okay(var, expr, info):
         # NOTE: this fails if we have two different structs with
         # the same name (e.g. in different scopes.) I don't think
         # this is a big issue to solve here, but worth noting that
-        # it's actually wrong.
+        # it's not actually correct.
         return var.name == expr.name, "Can't convert struct %s to struct %s" % (expr.name, var.name)
 
     raise Exception(
@@ -288,6 +314,7 @@ def get_type(node, context, info):
                 # Put parameters into function scope, by parsing them
                 # as declarations.
                 param_type = get_type(param, func_context, info_with_return)
+
                 # Also, save what type of parameters are expected by the
                 # function so we can check it if it's called later.
                 func_params.append((param.name, param_type))
@@ -644,42 +671,58 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
                                          + "Can't assign an unowned pointer value to owned pointer variable " + lval_name + ".")
             elif is_owned_ptr(rval_type):
                 # If the node being assigned to currently doesn't have a valid value....
-                if condition[lval_name] in {State.ZOMBIE, State.UNINIT}:
+                if lval_name in condition and condition[lval_name] in {State.ZOMBIE, State.UNINIT}:
                     # and the node being assigned DOES have a valid value... (or it's, like, a function return value)
                     if not is_lvalue(rvalue) or condition[node_repr(rvalue)] == State.OWNED:
                         # Move ownership from rvalue to lvalue.
-                        condition[lval_name] = State.OWNED
+                        if lval_name in condition:
+                            # Only make a note of lvalue's state changing if it's actually declared already.
+                            # This prevents us from complaining if we assign to a global.
+                            condition[lval_name] = State.OWNED
                         if is_lvalue(rvalue):
-                            condition[node_repr(rvalue)] = State.ZOMBIE
+                            # If lval_type is '@frees', we don't allow access through the rvalue
+                            # pointer. Otherwise, we just make it into an unowned pointer.
+                            condition[node_repr(rvalue)] = get_final_state(lval_type)
                     elif condition[node_repr(rvalue)] == State.UNKNOWN or condition[node_repr(rvalue)] == State.ZOMBIE:
                         # The rvalue was already moved somewhere else. (or its status is unknown)
-                        condition[lval_name] = State.UNKNOWN
+                        if lval_name in condition:
+                            condition[lval_name] = State.UNKNOWN
                         raise TypeCheckError(coord, helptext + "Can't move pointer value "
                                            + node_repr(rvalue) + " to owned pointer in assignment; it has"
                                            + (" possibly" if condition[node_repr(rvalue)] == State.UNKNOWN else "")
-                                           + " already been moved.")
+                                           + " already been moved or freed.")
                     else:
-                        condition[lval_name] = State.MAYBEINIT
+                        if lval_name in condition:
+                            condition[lval_name] = State.MAYBEINIT
                         raise TypeCheckError(coord, helptext + "Can't move pointer value "
                                            + node_repr(rvalue) + " to owned pointer in assignment; it has"
                                            + (" possibly" if condition[node_repr(rvalue)] == State.MAYBEINIT else "")
                                            + " not been initialized.")
                 else:
                     # Trying to overwrite a possibly-still-owned owned pointer.
-                    condition[lval_name] = State.OWNED
+                    if lval_name in condition:
+                        condition[lval_name] = State.OWNED
                     raise TypeCheckError(coord, helptext + "Can't overwrite the owned pointer value "
                                            + lval_name + "; it has "
-                                           + ("possibly " if condition[lval_name] == State.MAYBEINIT else "")
+                                           + ("possibly " if lval_name not in condition
+                                                  or condition[lval_name] == State.MAYBEINIT else "")
                                            + "already been initialized with an owned value.")
 
 
-def check_owners(node, precondition, helptext=""):
+# Flag for whether ownership processing is inside a function or not.
+in_global_scope = True
+
+def check_owners(node, precondition, final, helptext=""):
     """ Check node for any illegal pointer usage.
         Takes a 'precondition' parameter, a dict mapping
         strings to pointer states.
+        The 'final' parameter represents the desired final
+        pointer states for each variable.
         Returns a 'postcondition', the set of new pointer
         states after the operation corresponding to the
         node. """
+    global in_global_scope
+
     # Find the C type of the node, determined by get_type above.
     node_type = node_types.get(node, None)
 
@@ -694,14 +737,18 @@ def check_owners(node, precondition, helptext=""):
 
         for decl in node.ext:
             try:
-                check_owners(decl, condition, helptext)
+                check_owners(decl, condition, final, helptext)
             except TypeCheckError as e:
                 show_error(e)
 
     elif t == c_ast.FuncDef:
+        in_global_scope = False
+
         precondition = condition.copy()
+        final = final.copy()
         for param in node.decl.type.args.params:
             paramtype = node_types[param]
+
             if is_ptr(paramtype):
                 # Assume ownership was handled correctly outside the function.
                 # If it isn't, we'll catch it when the function is called.
@@ -710,32 +757,37 @@ def check_owners(node, precondition, helptext=""):
                 else:
                     precondition[param.name] = State.UNOWNED
 
-        postcondition = check_owners(node.body, precondition, helptext)
+                final[param.name] = get_final_state(paramtype)
+
+        postcondition = check_owners(node.body, precondition, final, helptext)
+
+        in_global_scope = True
 
     elif t == c_ast.Compound:
         condition = condition.copy()
+        final = final.copy()
 
         for stmt in node.block_items:
-            #print(" (1)", condition)
-            #print(filecontent[stmt.coord.line-1])
             try:
                 # Update the condition with each line of the block.
-                condition = check_owners(stmt, condition, helptext)
+                condition = check_owners(stmt, condition, final, helptext)
             except TypeCheckError as e:
                 show_error(e)
-            #print(" (2)", condition)
-            #print()
 
     elif t == c_ast.Decl:
+        # TODO I don't have a great way of handling global owned pointer state...
         if is_ptr(node_type):
-            if is_owned_ptr(node_type):
-                condition[node.name] = State.UNINIT
-            else:
-                condition[node.name] = State.UNOWNED
+            if not in_global_scope:
+                if is_owned_ptr(node_type):
+                    condition[node.name] = State.UNINIT
+                else:
+                    condition[node.name] = State.UNOWNED
+
+                final[node.name] = get_final_state(node_type)
 
         if node.init is not None:
             # Right side might be a function call, so we have to evaluate its ownership as well.
-            check_owners(node.init, condition)
+            check_owners(node.init, condition, final)
 
             init_type = node_types[node.init]
             check_assignment(node.name, node.init, node_type, init_type, condition, node.coord, helptext)
@@ -758,7 +810,7 @@ def check_owners(node, precondition, helptext=""):
         lval_type = node_types[node.lvalue]
 
         # Right side might be a function call, so we have to evaluate its ownership as well.
-        check_owners(node.rvalue)
+        check_owners(node.rvalue, condition, final)
 
         rval_type = node_types[node.rvalue]
 
@@ -797,16 +849,16 @@ def check_owners(node, precondition, helptext=""):
         condition = unify_conditions(unified, loop_again)
 
     elif t == c_ast.If:
-        after_cond = check_owners(node.cond, condition, helptext)
+        after_cond = check_owners(node.cond, condition, final, helptext)
 
         # Check the true branch of the if
-        after_then = check_owners(node.iftrue, after_cond, helptext)
+        after_then = check_owners(node.iftrue, after_cond, final, helptext)
 
         # Check the false branch of the if - or if it doesn't exist,
         # use the starting condition as the "after else" condition
         # (since nothing will change if the if's condition is false)
         if node.iffalse is not None:
-            after_else = check_owners(node.iffalse, after_cond, helptext)
+            after_else = check_owners(node.iffalse, after_cond, final, helptext)
         else:
             after_else = condition
 
@@ -825,8 +877,12 @@ def check_owners(node, precondition, helptext=""):
     elif t == c_ast.Return:
         if is_ptr(node_types[node.expr]):
             if is_lvalue(node.expr):
-                # TODO Check ownership matches function return expectation.
-                condition[node_repr(node.expr)] = State.ZOMBIE
+                if final[node_repr(node.expr)] == State.UNOWNED:
+                    condition[node_repr(node.expr)] = State.UNOWNED
+                else:
+                    raise TypeCheckError(node.coord, helptext
+                                         + "returning '@frees' owned pointer is illegal; must be freed before "
+                                         + "the end of the function.")
 
         for var in condition:
             if condition[var] not in {State.UNOWNED, State.ZOMBIE, State.UNINIT}:
@@ -838,11 +894,20 @@ def check_owners(node, precondition, helptext=""):
                     explanation = "still contains an owned pointer value, which will leak here"
                 raise TypeCheckError(node.coord, helptext + "at return, pointer value "
                                         + var + " " + explanation + ".")
+            elif condition[var] == State.UNOWNED and final[var] == State.ZOMBIE:
+                raise TypeCheckError(node.coord, helptext + "at return, pointer value "
+                                        + var + " is unowned (possibly moved somewhere else)"
+                                        + " but was supposed to be freed (declared by '@frees' annotation).")
+            elif condition[var] == State.ZOMBIE and final[var] == State.UNOWNED:
+                raise TypeCheckError(node.coord, helptext + "at return, pointer value "
+                                        + var + " was freed, but was just supposed to transfer ownership away."
+                                        + " (Use the '@frees' annotation for owned pointers that will be freed.)")
 
     elif t == c_ast.FuncCall:
         if node.name.name == "free":
-            # "free" is special-cased here, but in a full implementation, we would also support
-            # marking function parameters as "gets freed by this function."
+            # We do support marking function parameters as "gets freed by this function."
+            # However, pycparser has trouble parsing C headers, so 'free' and 'malloc' are
+            # special-cased here at the moment for this 'proof-of-concept' implementation.
             if is_owned_ptr(node_types[node.args.exprs[0]]):
                 ptr_cond = condition[node_repr(node.args.exprs[0])]
                 if ptr_cond == State.OWNED:
@@ -877,7 +942,8 @@ def check_owners(node, precondition, helptext=""):
                             ptr_cond = condition[node_repr(arg)]
                             if ptr_cond == State.OWNED:
                                 # Great! Transfer ownership to the function.
-                                condition[node_repr(arg)] = State.ZOMBIE
+                                # Use get_final_state to determine whether the argument is freed or not.
+                                condition[node_repr(arg)] = get_final_state(expected_param_type)
                             elif ptr_cond in {State.ZOMBIE, State.UNKNOWN}:
                                 condition[node_repr(arg)] = State.ZOMBIE
                                 raise TypeCheckError(arg.coord, helptext + "Can't pass "
@@ -932,4 +998,4 @@ if __name__ == "__main__":
 
     if not error_in_typecheck_phase:
         # Now, we run through the AST again, checking ownership.
-        check_owners(ast, {})
+        check_owners(ast, {}, {})
