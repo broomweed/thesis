@@ -42,7 +42,7 @@ class NamedType:
         self.names = names
         for name in names:
             if name not in { "unsigned", "signed", "long", "short",
-                             "int", "float", "double", "char" }:
+                             "int", "float", "double", "char", "void" }:
                 self.is_typedef = True
                 break
         else:
@@ -80,6 +80,9 @@ class PointerType:
 
     def __str__(self):
         return str(self.ptrto) + "*" + "".join([" " + x for x in self.quals])
+
+
+malloc_return_type = PointerType(NamedType(["void"], []), ["@owned"])
 
 
 def is_ptr(t, info=None):
@@ -187,6 +190,12 @@ def initialization_okay(var, expr, info):
     var = unwrap_type(var, info)
     expr = unwrap_type(expr, info)
 
+    if is_ptr(var, info) and expr == malloc_return_type:
+        # Allow malloc return values to be converted to any pointer type.
+        # This kinda sucks, because we can't be sure it's the right thing,
+        # but there's not much we can do here because of how C works.
+        return True, ""
+
     if is_ptr(var, info) and not is_ptr(expr, info):
         return False, "Making pointer from non-pointer without a cast."
     elif not is_ptr(var, info) and is_ptr(expr, info):
@@ -222,6 +231,8 @@ def unwrap_type(t, info):
         typedef for B, and we have an A const, unwrapping
         it should yield a B const. """
     def recurse(t, info, extra_quals):
+        if t == malloc_return_type:
+            return t
         if type(t) == NamedType and t.is_typedef:
             return recurse(info['typedefs'][t.names[0]], info, extra_quals + t.quals)
         else:
@@ -299,6 +310,9 @@ def get_type(node, context, info):
         info_with_return = copy.deepcopy(info)
         info_with_return['func_return'] = convert_type(node.decl.type.type, info)
         info_with_return['func_name'] = node.decl.name
+
+        # Save the return type of the function.
+        node_types[node] = info_with_return['func_return']
 
         # Use a fresh copy of the context dict, so declarations
         # inside each function don't leak outside it, even if we
@@ -520,7 +534,7 @@ def get_type(node, context, info):
             )
 
     elif t == c_ast.FuncCall:
-        if node.name.name == "free" or node.name.name == "malloc":
+        if node.name.name == "free":
             # Skip this, since we can't check it anyway
             # (we don't handle void* right now)
             # and pycparser chokes on <stdlib.h>. So we just
@@ -530,7 +544,17 @@ def get_type(node, context, info):
                 # or else it'll choke later when it tries to see what
                 # types the parameters to free() had.
                 get_type(param, context, info)
+            node_types[node] = None
             return None
+
+        if node.name.name == "malloc":
+            for param in node.args.exprs:
+                # But we still have to mark each node with its type,
+                # or else it'll choke later when it tries to see what
+                # types the parameters to free() had.
+                get_type(param, context, info)
+            node_types[node] = malloc_return_type
+            return malloc_return_type
 
         func_type = function_types[node.name.name]
         return_type = func_type[0]
@@ -633,7 +657,7 @@ def unify_conditions(c1, c2):
     return new_cond
 
 
-def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, helptext):
+def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, helptext, returning=False):
     if is_ptr(lval_type):
         # Assignment is never OK when the right-side pointer is not OWNED or UNOWNED.
         # Four slightly different error messages depending on the particular state.
@@ -654,24 +678,42 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
                 condition[lval_name] = rval_cond
                 if rval_cond != State.UNOWNED:
                     condition[node_repr(rvalue)] = State.ZOMBIE
-                raise TypeCheckError(coord, helptext + "Can't assign from the value of the owned pointer "
-                                           + node_repr(rvalue) + explanation)
+                if not returning:
+                    raise TypeCheckError(coord, helptext + "Can't assign from the value of the owned pointer "
+                                               + node_repr(rvalue) + explanation)
+                else:
+                    raise TypeCheckError(coord, helptext + "Can't return the value of the owned pointer "
+                                               + node_repr(rvalue) + explanation)
+
         if is_owned_ptr(lval_type):
             if is_unowned_ptr(rval_type):
                 if is_lvalue(rvalue):
                     condition[lval_name] = State.OWNED
-                    raise TypeCheckError(coord, helptext + "Can't store unowned pointer value "
-                                         + node_repr(rvalue)
-                                         + " in owned pointer variable "
-                                         + lval_name + ".")
+                    if not returning:
+                        raise TypeCheckError(coord, helptext + "Can't store unowned pointer value "
+                                             + node_repr(rvalue)
+                                             + " in owned pointer variable "
+                                             + lval_name + ".")
+                    else:
+                        raise TypeCheckError(coord, helptext + "Can't return unowned pointer value "
+                                             + node_repr(rvalue) + " when an owned pointer value was expected.")
                 else:
                     # Update condition as though error didn't happen -- in case we have more errors later
                     condition[lval_name] = State.OWNED
-                    raise TypeCheckError(coord, helptext
-                                         + "Can't assign an unowned pointer value to owned pointer variable " + lval_name + ".")
+                    if not returning:
+                        raise TypeCheckError(coord, helptext
+                                             + "Can't assign an unowned pointer value to owned pointer " + lval_name + ".")
+                    else:
+                        raise TypeCheckError(coord, helptext + "Can't return an unowned pointer value when "
+                                                             + "an owned pointer value was expected.")
+
             elif is_owned_ptr(rval_type):
                 # If the node being assigned to currently doesn't have a valid value....
                 if lval_name in condition and condition[lval_name] in {State.ZOMBIE, State.UNINIT}:
+                    if returning:
+                        operation = "return"
+                    else:
+                        operation = "assignment"
                     # and the node being assigned DOES have a valid value... (or it's, like, a function return value)
                     if not is_lvalue(rvalue) or condition[node_repr(rvalue)] == State.OWNED:
                         # Move ownership from rvalue to lvalue.
@@ -688,17 +730,17 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
                         if lval_name in condition:
                             condition[lval_name] = State.UNKNOWN
                         raise TypeCheckError(coord, helptext + "Can't move pointer value "
-                                           + node_repr(rvalue) + " to owned pointer in assignment; it has"
+                                           + node_repr(rvalue) + " to owned pointer in " + operation + "; it has"
                                            + (" possibly" if condition[node_repr(rvalue)] == State.UNKNOWN else "")
                                            + " already been moved or freed.")
                     else:
                         if lval_name in condition:
                             condition[lval_name] = State.MAYBEINIT
                         raise TypeCheckError(coord, helptext + "Can't move pointer value "
-                                           + node_repr(rvalue) + " to owned pointer in assignment; it has"
+                                           + node_repr(rvalue) + " to owned pointer in " + operation + "; it has"
                                            + (" possibly" if condition[node_repr(rvalue)] == State.MAYBEINIT else "")
                                            + " not been initialized.")
-                else:
+                elif not returning:
                     # Trying to overwrite a possibly-still-owned owned pointer.
                     if lval_name in condition:
                         condition[lval_name] = State.OWNED
@@ -711,6 +753,8 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
 
 # Flag for whether ownership processing is inside a function or not.
 in_global_scope = True
+# Return type of the current function
+func_return_type = None
 
 def check_owners(node, precondition, final, helptext=""):
     """ Check node for any illegal pointer usage.
@@ -721,7 +765,7 @@ def check_owners(node, precondition, final, helptext=""):
         Returns a 'postcondition', the set of new pointer
         states after the operation corresponding to the
         node. """
-    global in_global_scope
+    global in_global_scope, func_return_type
 
     # Find the C type of the node, determined by get_type above.
     node_type = node_types.get(node, None)
@@ -744,6 +788,8 @@ def check_owners(node, precondition, final, helptext=""):
     elif t == c_ast.FuncDef:
         in_global_scope = False
 
+        func_return_type = node_type
+
         precondition = condition.copy()
         final = final.copy()
         for param in node.decl.type.args.params:
@@ -762,6 +808,7 @@ def check_owners(node, precondition, final, helptext=""):
         postcondition = check_owners(node.body, precondition, final, helptext)
 
         in_global_scope = True
+        func_return_type = None
 
     elif t == c_ast.Compound:
         condition = condition.copy()
@@ -875,6 +922,9 @@ def check_owners(node, precondition, final, helptext=""):
         pass
 
     elif t == c_ast.Return:
+        check_assignment("", node.expr, func_return_type, node_types[node.expr],
+                                      condition, node.coord, helptext, True)
+
         if is_ptr(node_types[node.expr]):
             if is_lvalue(node.expr):
                 if final[node_repr(node.expr)] == State.UNOWNED:
@@ -898,10 +948,6 @@ def check_owners(node, precondition, final, helptext=""):
                 raise TypeCheckError(node.coord, helptext + "at return, pointer value "
                                         + var + " is unowned (possibly moved somewhere else)"
                                         + " but was supposed to be freed (declared by '@frees' annotation).")
-            elif condition[var] == State.ZOMBIE and final[var] == State.UNOWNED:
-                raise TypeCheckError(node.coord, helptext + "at return, pointer value "
-                                        + var + " was freed, but was just supposed to transfer ownership away."
-                                        + " (Use the '@frees' annotation for owned pointers that will be freed.)")
 
     elif t == c_ast.FuncCall:
         if node.name.name == "free":
