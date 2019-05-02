@@ -58,7 +58,7 @@ class StructType:
         Has a list of fields, which are represented as
         a list of tuples of names and types. """
     def __init__(self, name, fields, field_order, quals):
-        if len(name) != 0:
+        if name is not None:
             self.name = name
         else:
             self.name = '<anonymous>'
@@ -341,13 +341,14 @@ def get_type(node, context, info):
     elif t == c_ast.Compound:
         # As above.
         block_context = context.copy()
-        for stmt in node.block_items:
-            try:
-                get_type(stmt, block_context, info)
-            except TypeCheckError as e:
-                error_in_typecheck_phase = True
-                show_error(e)
-                continue
+        if node.block_items: # (might be an empty block...)
+            for stmt in node.block_items:
+                try:
+                    get_type(stmt, block_context, info)
+                except TypeCheckError as e:
+                    error_in_typecheck_phase = True
+                    show_error(e)
+                    continue
 
     elif t == c_ast.Decl:
         # A declaration. This is where we get the actual types
@@ -469,10 +470,9 @@ def get_type(node, context, info):
         l_type = get_type(node.left, context, info)
         r_type = get_type(node.right, context, info)
 
-        # TODO. Need to check if operation makes sense for given types.
-        # (like, we shouldn't use division on pointers)
-        # TODO. Also, need to handle type promotion etc.
-        # (this says e.g. int + float -> int, but it should be float)
+        # NOTE: Doesn't properly check whether the operation makes sense for given types.
+        # Also doesn't handle type promotion, etc., so certain operations (like int + float)
+        # will return the wrong result.
         node_types[node] = l_type
 
     elif t == c_ast.UnaryOp:
@@ -488,6 +488,14 @@ def get_type(node, context, info):
         elif node.op == "&":
             node_type = get_type(node.expr, context, info)
             node_types[node] = PointerType(node_type, [])
+        elif node.op == "sizeof":
+            # NOTE: Should technically be size_t
+            node_types[node] = NamedType(["int"], [])
+        else:
+            # it's -, !, ~, ++, or --, so results in the same type of thing as it
+            # was used on.
+            inner_type = get_type(node.expr, context, info)
+            node_types[node] = inner_type
 
     elif t == c_ast.If:
         cond_type = get_type(node.cond, context, info)
@@ -518,20 +526,35 @@ def get_type(node, context, info):
             node_types[node] = NamedType([node.type], [])
 
     elif t == c_ast.Cast:
+        if is_owned_ptr(convert_type(node.to_type.type, info)):
+            if not is_owned_ptr(get_type(node.expr, context, info)):
+                # Forbid casting unowned pointer to owned pointer.
+                raise TypeCheckError(node.coord, "Cannot cast pointer from unowned to owned.")
+
         node_types[node] = convert_type(node.to_type.type, info)
 
     elif t == c_ast.Return:
-        returned_type = get_type(node.expr, context, info)
-        ok, reason = assignment_okay(info['func_return'], returned_type, info)
-        if not ok:
+        if node.expr is not None and str(info['func_return']) != 'void':
+            returned_type = get_type(node.expr, context, info)
+            ok, reason = assignment_okay(info['func_return'], returned_type, info)
+            if not ok:
+                raise TypeCheckError(
+                    node.coord, "in function " + info['func_name']
+                              + ", declared as returning type "
+                              + expand_type_name(info['func_return'], info)
+                              + ": can't return expression of type "
+                              + expand_type_name(returned_type, info)
+                              + ": " + reason
+                )
+        elif node.expr is not None and str(info['func_return']) == 'void':
             raise TypeCheckError(
-                node.coord, "in function " + info['func_name']
-                          + ", declared as returning type "
-                          + expand_type_name(info['func_return'], info)
-                          + ": can't return expression of type "
-                          + expand_type_name(returned_type, info)
-                          + ": " + reason
-            )
+                node.coord, "returning value from void function " + info['func_name'])
+        elif node.expr is None and str(info['func_return']) != 'void':
+            raise TypeCheckError(
+                node.coord, "empty return from non-void function " + info['func_name'])
+        else:
+            # Empty return statement in void function, ok.
+            pass
 
     elif t == c_ast.FuncCall:
         if node.name.name == "free":
@@ -607,6 +630,8 @@ def node_repr(node):
             return "*" + node_repr(node.expr)
         elif node.op == "&":
             return "&" + node_repr(node.expr)
+    elif type(node) == c_ast.StructRef:
+        return node_repr(node.name) + node.type + node_repr(node.field)
     elif type(node) == c_ast.ID:
         return node.name
     else:
@@ -751,15 +776,71 @@ def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, 
                                            + "already been initialized with an owned value.")
 
 
+def add_to_condition(name, typ, condition, scopes, final, is_param=False):
+    """ Add a node of the given type to the current condition.
+        Called when we encounter a declaration, and also for
+        function parameters.
+        is_param should be true if it's a function parameter --
+        this makes the initial condition for owned pointers be
+        'owned' instead of 'uninitialized' """
+    if type(typ) == StructType:
+        for field in typ.field_order:
+            if is_owned_ptr(typ.fields[field]) or type(typ.fields[field]) == StructType:
+                add_to_condition(name + "." + field, typ.fields[field],
+                                 condition, scopes, final, is_param)
+    else:
+        if is_owned_ptr(typ):
+            condition[name] = State.UNINIT if not is_param else State.OWNED
+            scopes[-1].append(name)
+        else:
+            condition[name] = State.UNOWNED
+            scopes[-1].append(name)
+
+        final[name] = get_final_state(typ)
+
+        unwrapped_node = typ.ptrto
+        stars = "*"
+        # For pointers-to-owned-pointers (and pointers-to-pointers-to... etc),
+        # we need to also add entries for all owned pointed-to pointers in the chain.
+        # Hopefully that makes sense
+        while is_ptr(unwrapped_node):
+            if is_owned_ptr(unwrapped_node):
+                condition[stars + name] = State.OWNED
+            stars += "*"
+            unwrapped_node = unwrapped_node.ptrto
+
+
+def check_out_of_scope(var, condition, final, node, helptext):
+    """ Check whether a variable can properly go out of scope.
+        Called whenever an owned-pointer variable goes out of scope,
+        or for all currently-accessible variables when the current
+        function returns. """
+    if condition[var] not in {State.UNOWNED, State.ZOMBIE, State.UNINIT}:
+        if condition[var] == State.MAYBEINIT:
+            explanation = "was possibly initialized with an owned pointer value, which could leak here"
+        elif condition[var] == State.UNKNOWN:
+            explanation = "possibly contains a non-freed owned pointer value, which could leak here"
+        elif condition[var] == State.OWNED:
+            explanation = "still contains an owned pointer value, which will leak here"
+        raise TypeCheckError(node.coord, helptext + "pointer value "
+                                + var + " " + explanation + ".")
+    elif condition[var] == State.UNOWNED and final[var] == State.ZOMBIE:
+        raise TypeCheckError(node.coord, helptext + "pointer value "
+                                + var + " is unowned (possibly moved somewhere else)"
+                                + " but was supposed to be freed (declared by '@frees' annotation).")
+
+
 # Flag for whether ownership processing is inside a function or not.
 in_global_scope = True
 # Return type of the current function
 func_return_type = None
 
-def check_owners(node, precondition, final, helptext=""):
+def check_owners(node, precondition, scopes, final, helptext=""):
     """ Check node for any illegal pointer usage.
         Takes a 'precondition' parameter, a dict mapping
         strings to pointer states.
+        The 'scopes' parameter represents which variables were
+        introduced in successive outer scopes.
         The 'final' parameter represents the desired final
         pointer states for each variable.
         Returns a 'postcondition', the set of new pointer
@@ -781,7 +862,7 @@ def check_owners(node, precondition, final, helptext=""):
 
         for decl in node.ext:
             try:
-                check_owners(decl, condition, final, helptext)
+                check_owners(decl, condition, scopes, final, helptext)
             except TypeCheckError as e:
                 show_error(e)
 
@@ -792,20 +873,14 @@ def check_owners(node, precondition, final, helptext=""):
 
         precondition = condition.copy()
         final = final.copy()
-        for param in node.decl.type.args.params:
-            paramtype = node_types[param]
+        if node.decl.type.args: # might have no arguments!
+            for param in node.decl.type.args.params:
+                paramtype = node_types[param]
 
-            if is_ptr(paramtype):
-                # Assume ownership was handled correctly outside the function.
-                # If it isn't, we'll catch it when the function is called.
                 if is_owned_ptr(paramtype):
-                    precondition[param.name] = State.OWNED
-                else:
-                    precondition[param.name] = State.UNOWNED
+                    add_to_condition(param.name, paramtype, precondition, scopes, final, is_param=True)
 
-                final[param.name] = get_final_state(paramtype)
-
-        postcondition = check_owners(node.body, precondition, final, helptext)
+        postcondition = check_owners(node.body, precondition, scopes, final, helptext)
 
         in_global_scope = True
         func_return_type = None
@@ -814,27 +889,38 @@ def check_owners(node, precondition, final, helptext=""):
         condition = condition.copy()
         final = final.copy()
 
-        for stmt in node.block_items:
-            try:
-                # Update the condition with each line of the block.
-                condition = check_owners(stmt, condition, final, helptext)
-            except TypeCheckError as e:
-                show_error(e)
+        scopes.append([])
+
+        if node.block_items:
+            for stmt in node.block_items:
+                try:
+                    # Update the condition with each line of the block.
+                    condition = check_owners(stmt, condition, scopes, final, helptext)
+                except TypeCheckError as e:
+                    show_error(e)
+
+        for var in scopes[-1]:
+            if var in condition:
+                # Check the variables going out of scope to make sure they're OK.
+                check_out_of_scope(var, condition, final, node, helptext + "at end of this scope: ")
+
+        scopes.pop()
 
     elif t == c_ast.Decl:
-        # TODO I don't have a great way of handling global owned pointer state...
         if is_ptr(node_type):
             if not in_global_scope:
-                if is_owned_ptr(node_type):
-                    condition[node.name] = State.UNINIT
-                else:
-                    condition[node.name] = State.UNOWNED
+                add_to_condition(node.name, node_type, condition, scopes, final)
+            elif is_owned_ptr(node_type):
+                raise TypeCheckError(node.coord, "Can't have a global owned pointer.")
 
-                final[node.name] = get_final_state(node_type)
+        if type(node_type) == StructType and not in_global_scope:
+            add_to_condition(node.name, node_type, condition, scopes, final)
+
+        scopes[-1].append(node.name)
 
         if node.init is not None:
             # Right side might be a function call, so we have to evaluate its ownership as well.
-            check_owners(node.init, condition, final)
+            check_owners(node.init, condition, scopes, final)
 
             init_type = node_types[node.init]
             check_assignment(node.name, node.init, node_type, init_type, condition, node.coord, helptext)
@@ -843,11 +929,9 @@ def check_owners(node, precondition, final, helptext=""):
         pass
 
     elif t == c_ast.ArrayRef:
-        # TODO
         pass
 
     elif t == c_ast.StructRef:
-        # TODO
         pass
 
     elif t == c_ast.Assignment:
@@ -857,7 +941,7 @@ def check_owners(node, precondition, final, helptext=""):
         lval_type = node_types[node.lvalue]
 
         # Right side might be a function call, so we have to evaluate its ownership as well.
-        check_owners(node.rvalue, condition, final)
+        check_owners(node.rvalue, condition, scopes, final)
 
         rval_type = node_types[node.rvalue]
 
@@ -867,28 +951,33 @@ def check_owners(node, precondition, final, helptext=""):
         pass
 
     elif t == c_ast.UnaryOp:
-        # TODO Forbid 'p++' etc. on owned pointers
+        if is_owned_ptr(node_types[node]):
+            if node.op in { "p++", "++p", "p--", "--p" }:
+                raise TypeCheckError(node.coord, "Cannot use unary "
+                        + ("increment" if "++" in node.op else "decrement")
+                        + " on an owned pointer.")
+
         pass
 
     elif t == c_ast.DoWhile:
         # Run the loop once...
-        after_loop = check_owners(node.stmt, condition, helptext + "in first iteration of do/while loop: ")
-        after_loop = check_owners(node.cond, after_loop, helptext + "in first iteration of do/while loop: ")
+        after_loop = check_owners(node.stmt, condition, scopes, helptext + "in first iteration of do/while loop: ")
+        after_loop = check_owners(node.cond, after_loop, scopes, helptext + "in first iteration of do/while loop: ")
 
         # and then possibly run it again -- has to work under both conditions
-        loop_again = check_owners(node.stmt, after_loop, helptext + "when running do/while loop again: ")
-        loop_again = check_owners(node.cond, loop_again, helptext + "when running do/while loop again: ")
+        loop_again = check_owners(node.stmt, after_loop, scopes, helptext + "when running do/while loop again: ")
+        loop_again = check_owners(node.cond, loop_again, scopes, helptext + "when running do/while loop again: ")
 
         condition = unify_conditions(loop_again, after_loop)
 
     elif t == c_ast.While:
         # Run the loop once...
-        after_loop = check_owners(node.cond, condition, helptext + "in first iteration of while loop: ")
-        after_loop = check_owners(node.stmt, after_loop, helptext + "in first iteration of while loop: ")
+        after_loop = check_owners(node.cond, condition, scopes, helptext + "in first iteration of while loop: ")
+        after_loop = check_owners(node.stmt, after_loop, scopes, helptext + "in first iteration of while loop: ")
 
         # and then possibly run it again
-        loop_again = check_owners(node.cond, after_loop, helptext + "when running while loop again: ")
-        loop_again = check_owners(node.stmt, loop_again, helptext + "when running while loop again: ")
+        loop_again = check_owners(node.cond, after_loop, scopes, helptext + "when running while loop again: ")
+        loop_again = check_owners(node.stmt, loop_again, scopes, helptext + "when running while loop again: ")
 
         # The final one is the unification of running the loop and not running the loop, since
         # with a while loop we might skip over it entirely
@@ -896,16 +985,16 @@ def check_owners(node, precondition, final, helptext=""):
         condition = unify_conditions(unified, loop_again)
 
     elif t == c_ast.If:
-        after_cond = check_owners(node.cond, condition, final, helptext)
+        after_cond = check_owners(node.cond, condition, scopes, final, helptext)
 
         # Check the true branch of the if
-        after_then = check_owners(node.iftrue, after_cond, final, helptext)
+        after_then = check_owners(node.iftrue, after_cond, scopes, final, helptext)
 
         # Check the false branch of the if - or if it doesn't exist,
         # use the starting condition as the "after else" condition
         # (since nothing will change if the if's condition is false)
         if node.iffalse is not None:
-            after_else = check_owners(node.iffalse, after_cond, final, helptext)
+            after_else = check_owners(node.iffalse, after_cond, scopes, final, helptext)
         else:
             after_else = condition
 
@@ -922,32 +1011,21 @@ def check_owners(node, precondition, final, helptext=""):
         pass
 
     elif t == c_ast.Return:
-        check_assignment("", node.expr, func_return_type, node_types[node.expr],
-                                      condition, node.coord, helptext, True)
+        if node.expr:
+            check_assignment("", node.expr, func_return_type, node_types[node.expr],
+                                          condition, node.coord, helptext, True)
 
-        if is_ptr(node_types[node.expr]):
-            if is_lvalue(node.expr):
-                if final[node_repr(node.expr)] == State.UNOWNED:
-                    condition[node_repr(node.expr)] = State.UNOWNED
-                else:
-                    raise TypeCheckError(node.coord, helptext
-                                         + "returning '@frees' owned pointer is illegal; must be freed before "
-                                         + "the end of the function.")
+            if is_ptr(node_types[node.expr]):
+                if is_lvalue(node.expr):
+                    if final[node_repr(node.expr)] == State.UNOWNED:
+                        condition[node_repr(node.expr)] = State.UNOWNED
+                    else:
+                        raise TypeCheckError(node.coord, helptext
+                                             + "returning '@frees' owned pointer is illegal; must be freed before "
+                                             + "the end of the function.")
 
         for var in condition:
-            if condition[var] not in {State.UNOWNED, State.ZOMBIE, State.UNINIT}:
-                if condition[var] == State.MAYBEINIT:
-                    explanation = "was possibly initialized with an owned pointer value, which could leak here"
-                elif condition[var] == State.UNKNOWN:
-                    explanation = "possibly contains a non-freed owned pointer value, which could leak here"
-                elif condition[var] == State.OWNED:
-                    explanation = "still contains an owned pointer value, which will leak here"
-                raise TypeCheckError(node.coord, helptext + "at return, pointer value "
-                                        + var + " " + explanation + ".")
-            elif condition[var] == State.UNOWNED and final[var] == State.ZOMBIE:
-                raise TypeCheckError(node.coord, helptext + "at return, pointer value "
-                                        + var + " is unowned (possibly moved somewhere else)"
-                                        + " but was supposed to be freed (declared by '@frees' annotation).")
+            check_out_of_scope(var, condition, final, node, helptext + "at return: ")
 
     elif t == c_ast.FuncCall:
         if node.name.name == "free":
@@ -976,6 +1054,8 @@ def check_owners(node, precondition, final, helptext=""):
                                         )
             else:
                 raise TypeCheckError(node.coord, helptext + "Can't free unowned pointer.")
+        elif node.name.name == "malloc":
+            pass
         else:
             # Regular function call. Check that ownership matches its parameter expectations.
             for index, arg in enumerate(node.args.exprs):
@@ -1044,4 +1124,4 @@ if __name__ == "__main__":
 
     if not error_in_typecheck_phase:
         # Now, we run through the AST again, checking ownership.
-        check_owners(ast, {}, {})
+        check_owners(ast, {}, [[]], {})
