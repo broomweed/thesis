@@ -242,6 +242,15 @@ def unwrap_type(t, info):
     return recurse(t, info, [])
 
 
+def unowned_version(owned_ptr, info):
+    expansion = unwrap_type(owned_ptr, info)
+    while "@owned" in expansion.quals:
+        expansion.quals.remove("@owned")
+    while "@frees" in expansion.quals:
+        expansion.quals.remove("@frees")
+    return expansion
+
+
 def expand_type_name(t, info):
     """ Given a type, print it in a way that exposes all
         typedefs. """
@@ -470,10 +479,15 @@ def get_type(node, context, info):
         l_type = get_type(node.left, context, info)
         r_type = get_type(node.right, context, info)
 
-        # NOTE: Doesn't properly check whether the operation makes sense for given types.
-        # Also doesn't handle type promotion, etc., so certain operations (like int + float)
-        # will return the wrong result.
-        node_types[node] = l_type
+        if is_owned_ptr(l_type):
+            node_types[node] = unowned_version(l_type, info)
+        elif is_owned_ptr(r_type):
+            node_types[node] = unowned_version(r_type, info)
+        else:
+            # NOTE: Doesn't properly check whether the operation makes sense for given types.
+            # Also doesn't handle type promotion, etc., so certain operations (like int + float)
+            # will return the wrong result.
+            node_types[node] = l_type
 
     elif t == c_ast.UnaryOp:
         if node.op == "*":
