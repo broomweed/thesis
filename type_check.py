@@ -696,8 +696,28 @@ def unify_conditions(c1, c2):
     return new_cond
 
 
-def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, helptext, returning=False):
-    if is_ptr(lval_type):
+def check_assignment(lval_name, rvalue, lval_type, rval_type, condition, coord, helptext, returning=False, outermost=None):
+    if outermost is None:
+        outermost = rvalue
+    if type(rval_type) == StructType:
+        for field in rval_type.field_order:
+            if is_owned_ptr(rval_type.fields[field]):
+                if condition[node_repr(rvalue) + "." + field] != State.OWNED:
+                    if not returning:
+                        raise TypeCheckError(coord, "Cannot use struct " + node_repr(outermost)
+                                    + " on right side of assignment, because "
+                                    + node_repr(rvalue) + "." + field
+                                    + " is not in a valid state.")
+                    else:
+                        raise TypeCheckError(coord, "Cannot return struct " + node_repr(outermost)
+                                    + ", because " + node_repr(rvalue) + "." + field
+                                    + " is not in a valid state.")
+
+        for field in lval_type.field_order:
+            if is_owned_ptr(lval_type.fields[field]) or type(lval_type.fields[field]) == StructType:
+                check_assignment(lval_name + "." + field, c_ast.StructRef(rvalue, ".", c_ast.ID(field)),
+                     lval_type.fields[field], rval_type.fields[field], condition, coord, helptext, returning, rvalue)
+    elif is_ptr(lval_type):
         # Assignment is never OK when the right-side pointer is not OWNED or UNOWNED.
         # Four slightly different error messages depending on the particular state.
         if is_lvalue(rvalue):
